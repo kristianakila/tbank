@@ -1,68 +1,43 @@
 {
-  "name": "tbank-payments",
-  "version": "1.2.1",
-  "description": "Библиотека для интеграции с API T-Bank эквайринг. Поддерживает платежи картами, СБП, рекуррентные платежи, управление клиентами и картами, QR-коды.",
-  "main": "index.js",
-  "types": "index.d.ts",
-  "author": "esurkov1",
-  "license": "MIT",
-  "keywords": [
-    "tbank",
-    "tinkoff",
-    "acquiring",
-    "payments",
-    "ecommerce",
-    "sbp",
-    "qr",
-    "russia",
-    "api"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/esurkov1/tbank-payments.git"
-  },
-  "bugs": {
-    "url": "https://github.com/esurkov1/tbank-payments/issues"
-  },
-  "homepage": "https://github.com/esurkov1/tbank-payments#readme",
-  "engines": {
-    "node": ">=18.0.0"
+  "name": "tbank-payment-server",
+  "version": "1.0.0",
+  "description": "Сервер для обработки платежей через T-Bank API",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "nodemon server/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "dependencies": {
     "axios": "^1.10.0",
     "axios-retry": "^4.5.0",
-    "joi": "^17.13.3"
+    "body-parser": "^2.2.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^5.2.1",
+    "joi": "^17.13.3",
+    "tbank-payments": "^1.2.1",
+    "helmet": "^8.0.0",
+    "morgan": "^1.10.0",
+    "express-rate-limit": "^7.5.0"
   },
   "devDependencies": {
-    "@semantic-release/changelog": "^6.0.3",
-    "@semantic-release/git": "^10.0.1",
     "@types/node": "^22.0.0",
-    "dotenv": "^16.4.7",
     "eslint": "^8.57.0",
     "eslint-config-airbnb-base": "^15.0.0",
     "eslint-config-prettier": "^9.1.0",
-    "husky": "^9.1.7",
     "jest": "^30.0.4",
-    "lint-staged": "^15.5.2",
+    "nodemon": "^3.1.7",
     "prettier": "^3.3.3",
-    "semantic-release": "^23.0.2"
+    "supertest": "^7.0.0"
   },
-  "scripts": {
-    "test": "jest",
-    "test:watch": "jest --watch",
-    "test:coverage": "jest --coverage",
-    "test:integration": "jest --config jest.integration.config.js",
-    "lint": "eslint .",
-    "lint:fix": "eslint . --fix",
-    "format": "prettier --write .",
-    "format:check": "prettier --check .",
-    "prepare": "husky install"
-  },
-  "files": [
-    "index.js",
-    "index.d.ts",
-    "lib",
-    "README.md",
-    "LICENSE"
-  ]
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
