@@ -15,7 +15,6 @@ app.use(bodyParser.urlencoded({ extended: true }));
 const admin = require('firebase-admin');
 
 try {
-  // Инициализация Firebase
   admin.initializeApp({
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
@@ -42,91 +41,288 @@ const tbank = new TbankPayments({
   apiUrl: process.env.TBANK_API_URL || 'https://securepay.tinkoff.ru'
 });
 
-// Промежуточный middleware для tbank
-app.use((req, res, next) => {
-  req.tbank = tbank;
-  req.db = db; // Добавляем Firestore в запрос
-  req.admin = admin; // Добавляем admin в запрос
-  next();
-});
-
 // ========== ПОМОЩНИКИ ДЛЯ FIREBASE ==========
 /**
- * Сохраняет платеж в Firebase
- * @param {string} userId - ID пользователя Telegram
- * @param {string} orderId - ID заказа
- * @param {object} tinkoffData - Данные от T-Bank
- * @param {string} rebillId - RebillId (если есть)
+ * Находит документ заказа в Firebase по OrderId T-Bank
  */
-async function savePaymentToFirebase(userId, orderId, tinkoffData, rebillId = null) {
+async function findOrderByTbankOrderId(tbankOrderId) {
   try {
-    if (!userId || !orderId) {
-      console.warn('⚠️ Не указаны userId или orderId для сохранения в Firebase');
-      return null;
-    }
-
-    const paymentData = {
-      tinkoff: tinkoffData,
-      status: tinkoffData.Status || 'INITIATED',
-      amount: tinkoffData.Amount ? tinkoffData.Amount / 100 : 0,
-      paymentId: tinkoffData.PaymentId,
-      orderId: tinkoffData.OrderId || orderId,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    };
-
-    // Добавляем rebillId если есть
-    if (rebillId) {
-      paymentData.rebillId = rebillId;
-      paymentData.finishedAt = admin.firestore.FieldValue.serverTimestamp();
-    }
-
-    // Сохраняем в Firestore
-    const docRef = db.collection('telegramUsers')
-      .doc(userId.toString())
-      .collection('orders')
-      .doc(orderId);
-
-    await docRef.set(paymentData, { merge: true });
+    // Ищем во всех коллекциях orders всех пользователей
+    const ordersQuery = await db.collectionGroup('orders')
+      .where('tinkoff.OrderId', '==', tbankOrderId)
+      .limit(1)
+      .get();
     
-    console.log(`✅ Платеж сохранен в Firebase: userId=${userId}, orderId=${orderId}`);
-    return docRef.id;
+    if (!ordersQuery.empty) {
+      const orderDoc = ordersQuery.docs[0];
+      const userId = orderDoc.ref.parent.parent.id;
+      const orderId = orderDoc.id;
+      const orderData = orderDoc.data();
+      
+      return {
+        userId,
+        orderId,
+        orderData,
+        docRef: orderDoc.ref
+      };
+    }
+    
+    return null;
   } catch (error) {
-    console.error('❌ Ошибка сохранения в Firebase:', error.message);
+    console.error('❌ Ошибка поиска заказа:', error);
     return null;
   }
 }
 
 /**
- * Обновляет статус платежа в Firebase
+ * Находит документ заказа по PaymentId T-Bank
  */
-async function updatePaymentStatus(userId, orderId, status, tinkoffData = {}) {
+async function findOrderByPaymentId(paymentId) {
   try {
-    const updateData = {
-      status: status,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      ...tinkoffData
-    };
+    // Ищем по paymentId
+    const ordersQuery = await db.collectionGroup('orders')
+      .where('tinkoff.PaymentId', '==', paymentId)
+      .limit(1)
+      .get();
+    
+    if (!ordersQuery.empty) {
+      const orderDoc = ordersQuery.docs[0];
+      const userId = orderDoc.ref.parent.parent.id;
+      const orderId = orderDoc.id;
+      const orderData = orderDoc.data();
+      
+      return {
+        userId,
+        orderId,
+        orderData,
+        docRef: orderDoc.ref
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('❌ Ошибка поиска заказа по PaymentId:', error);
+    return null;
+  }
+}
 
+/**
+ * Обновляет платеж в Firebase с данными из вебхука
+ */
+async function updatePaymentFromWebhook(userId, orderId, webhookData) {
+  try {
+    const {
+      PaymentId,
+      OrderId,
+      Success,
+      Status,
+      Amount,
+      RebillId,
+      CardId,
+      Pan,
+      Token,
+      PaymentURL
+    } = webhookData;
+    
+    const updateData = {
+      'tinkoff.webhook': webhookData,
+      'tinkoff.Status': Status,
+      'tinkoff.Success': Success,
+      'tinkoff.Amount': Amount,
+      status: Status,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+    
+    // Добавляем RebillId если есть
+    if (RebillId) {
+      updateData.rebillId = RebillId;
+      updateData['tinkoff.RebillId'] = RebillId;
+      updateData.finishedAt = admin.firestore.FieldValue.serverTimestamp();
+      console.log(`🔄 RebillId получен: ${RebillId}`);
+    }
+    
+    // Добавляем CardId если есть
+    if (CardId) {
+      updateData['tinkoff.CardId'] = CardId;
+    }
+    
+    // Обновляем документ
     await db.collection('telegramUsers')
       .doc(userId.toString())
       .collection('orders')
       .doc(orderId)
       .update(updateData);
-
-    console.log(`✅ Статус обновлен: userId=${userId}, orderId=${orderId}, status=${status}`);
+    
+    console.log(`✅ Платеж обновлен из вебхука: userId=${userId}, orderId=${orderId}`);
+    console.log(`📊 Статус: ${Status}, RebillId: ${RebillId || 'не получен'}`);
+    
+    return RebillId;
   } catch (error) {
-    console.error('❌ Ошибка обновления статуса:', error.message);
+    console.error('❌ Ошибка обновления из вебхука:', error.message);
+    return null;
   }
 }
 // =============================================
+
+// ВАЖНО: Для вебхука от T-Bank парсим raw body
+app.use('/api/webhook', bodyParser.raw({ type: '*/*' }));
+
+// Эндпоинт для вебхуков от T-Bank
+app.post('/api/webhook', async (req, res) => {
+  console.log('📨 ВЕБХУК: Получен запрос от T-Bank');
+  
+  let webhookData;
+  
+  try {
+    // T-Bank может отправлять данные в разных форматах
+    if (Buffer.isBuffer(req.body) || typeof req.body === 'string') {
+      // Парсим raw body
+      const bodyString = req.body.toString();
+      console.log('📨 ВЕБХУК: Raw body:', bodyString);
+      
+      try {
+        webhookData = JSON.parse(bodyString);
+      } catch (parseError) {
+        // Пробуем парсить как URL encoded
+        const parsed = new URLSearchParams(bodyString);
+        webhookData = {};
+        for (const [key, value] of parsed.entries()) {
+          webhookData[key] = value;
+        }
+      }
+    } else {
+      webhookData = req.body;
+    }
+    
+    console.log('📨 ВЕБХУК: Parsed data:', JSON.stringify(webhookData, null, 2));
+    
+    const {
+      TerminalKey,
+      OrderId,
+      Success,
+      Status,
+      PaymentId,
+      Amount,
+      RebillId,
+      CardId,
+      Pan,
+      Token
+    } = webhookData;
+    
+    // Логируем важные данные
+    console.log('📨 ВЕБХУК:');
+    console.log(`   OrderId: ${OrderId}`);
+    console.log(`   PaymentId: ${PaymentId}`);
+    console.log(`   Status: ${Status}`);
+    console.log(`   Success: ${Success}`);
+    console.log(`   RebillId: ${RebillId || 'не указан'}`);
+    console.log(`   Amount: ${Amount ? Amount / 100 : 0} руб.`);
+    
+    // ВАЖНО: Всегда возвращаем успех сразу
+    res.status(200).json({ Success: true, Error: '0' });
+    
+    // Асинхронно обрабатываем вебхук
+    setTimeout(async () => {
+      try {
+        console.log('🔄 ВЕБХУК: Начинаем обработку...');
+        
+        let orderInfo = null;
+        
+        // Пытаемся найти заказ по OrderId
+        if (OrderId) {
+          orderInfo = await findOrderByTbankOrderId(OrderId);
+        }
+        
+        // Если не нашли по OrderId, ищем по PaymentId
+        if (!orderInfo && PaymentId) {
+          orderInfo = await findOrderByPaymentId(PaymentId);
+        }
+        
+        if (orderInfo) {
+          console.log(`✅ ВЕБХУК: Найден заказ: userId=${orderInfo.userId}, orderId=${orderInfo.orderId}`);
+          
+          // Обновляем данные из вебхука
+          const rebillId = await updatePaymentFromWebhook(
+            orderInfo.userId, 
+            orderInfo.orderId, 
+            webhookData
+          );
+          
+          if (rebillId) {
+            console.log(`🎉 ВЕБХУК: RebillId сохранен: ${rebillId}`);
+            
+            // Можно отправить уведомление пользователю или в другую систему
+            // Например, сохранить rebillId в отдельную коллекцию для подписок
+            if (orderInfo.userId && rebillId) {
+              try {
+                await db.collection('telegramUsers')
+                  .doc(orderInfo.userId.toString())
+                  .collection('subscriptions')
+                  .doc('active')
+                  .set({
+                    rebillId: rebillId,
+                    cardLastDigits: Pan ? Pan.slice(-4) : null,
+                    cardId: CardId,
+                    status: 'active',
+                    lastPayment: admin.firestore.FieldValue.serverTimestamp(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                  }, { merge: true });
+                
+                console.log(`✅ ВЕБХУК: Подписка сохранена для userId=${orderInfo.userId}`);
+              } catch (subscriptionError) {
+                console.error('❌ ВЕБХУК: Ошибка сохранения подписки:', subscriptionError);
+              }
+            }
+          }
+        } else {
+          console.log('⚠️ ВЕБХУК: Заказ не найден в Firebase');
+          console.log('   OrderId:', OrderId);
+          console.log('   PaymentId:', PaymentId);
+          
+          // Можно создать новый документ для неопознанных платежей
+          try {
+            await db.collection('unknownPayments')
+              .doc(PaymentId || `unknown_${Date.now()}`)
+              .set({
+                webhookData: webhookData,
+                receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+                processed: false
+              });
+            
+            console.log('✅ ВЕБХУК: Неизвестный платеж сохранен для ручной обработки');
+          } catch (saveError) {
+            console.error('❌ ВЕБХУК: Ошибка сохранения неизвестного платежа:', saveError);
+          }
+        }
+        
+        console.log('✅ ВЕБХУК: Обработка завершена');
+        
+      } catch (asyncError) {
+        console.error('❌ ВЕБХУК: Ошибка асинхронной обработки:', asyncError.message);
+        console.error('❌ ВЕБХУК: Stack:', asyncError.stack);
+      }
+    }, 100); // Небольшая задержка для гарантии ответа T-Bank
+    
+  } catch (error) {
+    console.error('❌ ВЕБХУК: Критическая ошибка:', error.message);
+    // Все равно возвращаем 200 OK для T-Bank
+    res.status(200).json({ Success: false, Error: error.message });
+  }
+});
+
+// Промежуточный middleware для tbank
+app.use((req, res, next) => {
+  req.tbank = tbank;
+  req.db = db;
+  req.admin = admin;
+  next();
+});
 
 // Эндпоинт для инициализации рекуррентного платежа
 app.post('/api/init-recurrent', async (req, res) => {
   try {
     const { amount, email, phone, description, userId, orderId } = req.body;
     
-    // Проверяем обязательные поля
     if (!amount || !email) {
       return res.status(400).json({
         success: false,
@@ -137,7 +333,6 @@ app.post('/api/init-recurrent', async (req, res) => {
     console.log('🚀 Инициализация рекуррентного платежа');
     console.log('userId:', userId, 'orderId:', orderId);
 
-    // Создаём уникального клиента
     const customerKey = `customer-${Date.now()}`;
     
     // Создаем клиента
@@ -146,17 +341,17 @@ app.post('/api/init-recurrent', async (req, res) => {
       Email: email,
       Phone: phone || '+79001234567',
     });
-    console.log('Клиент создан:', customerKey);
+    console.log('✅ Клиент создан:', customerKey);
 
-    // Инициализируем привязку карты (3DS)
+    // Инициализируем привязку карты
     const cardRequest = await req.tbank.addCard({
       CustomerKey: customerKey,
-      CheckType: '3DS', // собираем 3DS
+      CheckType: '3DS',
     });
     
-    console.log('Запрос на привязку карты создан. RequestKey:', cardRequest.RequestKey);
+    console.log('✅ Запрос на привязку карты создан. RequestKey:', cardRequest.RequestKey);
     
-    // Создаем чек для платежа
+    // Создаем чек
     const receipt = {
       Email: email,
       Phone: phone || '+79001234567',
@@ -164,7 +359,7 @@ app.post('/api/init-recurrent', async (req, res) => {
       Items: [
         {
           Name: description || 'Подписка на сервис',
-          Price: amount * 100, // Конвертируем в копейки
+          Price: amount * 100,
           Quantity: 1,
           Amount: amount * 100,
           Tax: 'vat20',
@@ -174,10 +369,9 @@ app.post('/api/init-recurrent', async (req, res) => {
       ]
     };
 
-    // Генерируем уникальный OrderId
     const tbankOrderId = orderId || `recurrent-order-${Date.now()}`;
     
-    // Первый платеж по привязанной карте
+    // Первый платеж
     const payment = await req.tbank.initPayment({
       Amount: amount * 100,
       OrderId: tbankOrderId,
@@ -190,21 +384,39 @@ app.post('/api/init-recurrent', async (req, res) => {
       Receipt: receipt,
     });
 
-    console.log('✅ PaymentId для первого платежа:', payment.PaymentId);
+    console.log('✅ PaymentId:', payment.PaymentId);
 
-    // Сохраняем в Firebase если есть userId и orderId
+    // Сохраняем в Firebase
     let firebaseId = null;
     if (userId && orderId) {
-      firebaseId = await savePaymentToFirebase(
-        userId, 
-        orderId, 
-        {
-          ...payment,
-          CustomerKey: customerKey,
-          RequestKey: cardRequest.RequestKey,
-          Amount: amount * 100
-        }
-      );
+      try {
+        await db.collection('telegramUsers')
+          .doc(userId.toString())
+          .collection('orders')
+          .doc(orderId)
+          .set({
+            tinkoff: {
+              ...payment,
+              CustomerKey: customerKey,
+              RequestKey: cardRequest.RequestKey,
+              Amount: amount * 100,
+              OrderId: tbankOrderId,
+              PaymentId: payment.PaymentId
+            },
+            status: 'INITIATED',
+            amount: amount,
+            paymentId: payment.PaymentId,
+            orderId: orderId,
+            customerKey: customerKey,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        
+        firebaseId = orderId;
+        console.log(`✅ Данные сохранены в Firebase: userId=${userId}, orderId=${orderId}`);
+      } catch (firebaseError) {
+        console.error('❌ Ошибка сохранения в Firebase:', firebaseError);
+      }
     }
 
     res.json({
@@ -216,11 +428,12 @@ app.post('/api/init-recurrent', async (req, res) => {
       orderId: tbankOrderId,
       firebaseSaved: !!firebaseId,
       firebaseId: firebaseId,
-      message: 'Для завершения привязки карты перейдите по paymentUrl'
+      webhookUrl: process.env.NOTIFICATION_URL || 'https://tbank-xp1i.onrender.com/api/webhook',
+      message: 'Перейдите по paymentUrl для оплаты. RebillId придет на webhook.'
     });
 
   } catch (error) {
-    console.error('❌ Ошибка инициализации рекуррентного платежа:', error.message);
+    console.error('❌ Ошибка инициализации:', error.message);
     if (error.response) console.error('Детали:', error.response.data);
     
     res.status(500).json({
@@ -236,7 +449,6 @@ app.post('/api/run-payment', async (req, res) => {
   try {
     const { rebillId, amount, email, description, userId, orderId } = req.body;
     
-    // Проверяем обязательные поля
     if (!rebillId || !amount || !email) {
       return res.status(400).json({
         success: false,
@@ -244,7 +456,7 @@ app.post('/api/run-payment', async (req, res) => {
       });
     }
 
-    console.log('🚀 ЗАПУСК ПОВТОРНОГО СПИСАНИЯ');
+    console.log('🚀 Запуск рекуррентного платежа');
     console.log('RebillId:', rebillId);
     console.log('userId:', userId, 'orderId:', orderId);
 
@@ -266,7 +478,6 @@ app.post('/api/run-payment', async (req, res) => {
       ]
     };
 
-    // Генерируем новый orderId для T-Bank
     const tbankOrderId = orderId || `recurrent-charge-${Date.now()}`;
     
     // Создаем новый платеж
@@ -292,20 +503,37 @@ app.post('/api/run-payment', async (req, res) => {
       PaymentId: newPayment.PaymentId,
     });
 
-    // Сохраняем в Firebase если есть userId и orderId
+    // Сохраняем в Firebase
     let firebaseId = null;
     if (userId && orderId) {
-      firebaseId = await savePaymentToFirebase(
-        userId, 
-        orderId, 
-        {
-          ...finalStatus,
-          ...chargeResult,
-          RebillId: rebillId,
-          Amount: amount * 100
-        },
-        rebillId // Передаем rebillId для обновления
-      );
+      try {
+        await db.collection('telegramUsers')
+          .doc(userId.toString())
+          .collection('orders')
+          .doc(orderId)
+          .set({
+            tinkoff: {
+              ...finalStatus,
+              ...chargeResult,
+              RebillId: rebillId,
+              Amount: amount * 100,
+              PaymentId: newPayment.PaymentId,
+              OrderId: tbankOrderId
+            },
+            status: finalStatus.Status,
+            amount: amount,
+            paymentId: newPayment.PaymentId,
+            orderId: orderId,
+            rebillId: rebillId,
+            finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          }, { merge: true });
+        
+        firebaseId = orderId;
+      } catch (firebaseError) {
+        console.error('❌ Ошибка сохранения в Firebase:', firebaseError);
+      }
     }
 
     const response = {
@@ -320,7 +548,6 @@ app.post('/api/run-payment', async (req, res) => {
       message: chargeResult.Success ? 'Платеж успешно выполнен' : 'Ошибка при выполнении платежа',
     };
 
-    // Добавляем ошибку если есть
     if (chargeResult.ErrorCode) {
       response.error = {
         code: chargeResult.ErrorCode,
@@ -331,20 +558,11 @@ app.post('/api/run-payment', async (req, res) => {
     res.json(response);
 
   } catch (error) {
-    console.error('❌ Ошибка выполнения рекуррентного платежа:');
+    console.error('❌ Ошибка выполнения платежа:');
     
-    // Подробный анализ ошибки
-    if (error.code) {
-      console.log('Код ошибки:', error.code);
-    }
-    
-    if (error.message) {
-      console.log('Сообщение:', error.message);
-    }
-    
-    if (error.details) {
-      console.log('Детали:', error.details);
-    }
+    if (error.code) console.log('Код ошибки:', error.code);
+    if (error.message) console.log('Сообщение:', error.message);
+    if (error.details) console.log('Детали:', error.details);
 
     res.status(500).json({
       success: false,
@@ -355,82 +573,56 @@ app.post('/api/run-payment', async (req, res) => {
   }
 });
 
-// Эндпоинт для вебхуков (уведомлений от T-Bank)
-app.post('/api/webhook', async (req, res) => {
+// Эндпоинт для проверки статуса платежа
+app.post('/api/check-payment', async (req, res) => {
   try {
-    console.log('📨 Получен вебхук от T-Bank:', JSON.stringify(req.body, null, 2));
+    const { paymentId, orderId, userId } = req.body;
     
-    const { PaymentId, OrderId, Status, Success, RebillId, Amount } = req.body;
-    
-    // Всегда возвращаем OK сразу, чтобы T-Bank не считал доставку неудачной
-    res.json({ success: true, message: 'Webhook received' });
-    
-    // Асинхронно обрабатываем вебхук
-    setTimeout(async () => {
-      try {
-        console.log('🔄 Обработка вебхука асинхронно...');
-        
-        // Здесь вы можете найти userId по OrderId из вашей БД
-        // Пример: ищем заказ в Firestore по OrderId
-        // Это зависит от вашей структуры данных
-        
-        // ВАЖНО: Вам нужно реализовать логику поиска userId по OrderId
-        // Примерная логика:
-        /*
-        const ordersQuery = await db.collectionGroup('orders')
-          .where('tinkoff.OrderId', '==', OrderId)
-          .limit(1)
-          .get();
-        
-        if (!ordersQuery.empty) {
-          const orderDoc = ordersQuery.docs[0];
-          const userId = orderDoc.ref.parent.parent.id;
-          const orderId = orderDoc.id;
-          
-          // Обновляем статус в Firebase
-          await updatePaymentStatus(userId, orderId, Status, {
-            ...req.body,
-            finishedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-        }
-        */
-        
-        console.log('✅ Вебхук обработан');
-        
-      } catch (asyncError) {
-        console.error('❌ Ошибка асинхронной обработки вебхука:', asyncError.message);
-      }
-    }, 0);
-
-  } catch (error) {
-    console.error('Ошибка обработки вебхука:', error);
-    // Все равно возвращаем 200 OK для T-Bank
-    res.json({ success: false, error: error.message });
-  }
-});
-
-// Новый эндпоинт для сохранения платежа в Firebase
-app.post('/api/save-payment', async (req, res) => {
-  try {
-    const { userId, orderId, paymentData, rebillId } = req.body;
-    
-    if (!userId || !orderId || !paymentData) {
+    if (!paymentId) {
       return res.status(400).json({
         success: false,
-        error: 'Необходимо указать userId, orderId и paymentData'
+        error: 'Необходимо указать paymentId'
       });
     }
 
-    const firebaseId = await savePaymentToFirebase(userId, orderId, paymentData, rebillId);
+    const status = await tbank.getPaymentState({
+      PaymentId: paymentId
+    });
+
+    let firebaseData = null;
     
+    // Если есть userId и orderId, обновляем Firebase
+    if (userId && orderId) {
+      try {
+        await db.collection('telegramUsers')
+          .doc(userId.toString())
+          .collection('orders')
+          .doc(orderId)
+          .update({
+            'tinkoff.statusCheck': status,
+            'tinkoff.Status': status.Status,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        
+        console.log(`✅ Статус обновлен в Firebase: paymentId=${paymentId}`);
+      } catch (firebaseError) {
+        console.error('❌ Ошибка обновления Firebase:', firebaseError);
+      }
+    }
+
     res.json({
       success: true,
-      firebaseId: firebaseId,
-      message: 'Платеж сохранен в Firebase'
+      paymentId: paymentId,
+      status: status.Status,
+      rebillId: status.RebillId,
+      cardId: status.CardId,
+      amount: status.Amount ? status.Amount / 100 : 0,
+      updated: !!firebaseData,
+      data: status
     });
-    
+
   } catch (error) {
-    console.error('❌ Ошибка сохранения платежа:', error);
+    console.error('❌ Ошибка проверки статуса:', error);
     res.status(500).json({
       success: false,
       error: error.message
@@ -444,38 +636,14 @@ app.get('/health', (req, res) => {
     status: 'ok', 
     message: 'T-Bank Payment Server is running',
     timestamp: new Date().toISOString(),
-    firebase: admin.apps.length > 0 ? 'connected' : 'not connected'
-  });
-});
-
-// Главная страница
-app.get('/', (req, res) => {
-  res.json({
-    message: 'T-Bank Payment Server API with Firebase',
-    version: '1.1.0',
-    endpoints: [
-      'POST /api/init-recurrent - Инициализация рекуррентного платежа',
-      'POST /api/run-payment - Выполнение рекуррентного платежа',
-      'POST /api/webhook - Вебхук для уведомлений от T-Bank',
-      'POST /api/save-payment - Сохранить платеж в Firebase',
-      'GET /health - Проверка работоспособности'
-    ]
-  });
-});
-
-// Обработка ошибок 404
-app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    error: 'Endpoint not found',
-    path: req.path
+    firebase: admin.apps.length > 0 ? 'connected' : 'not connected',
+    webhookUrl: process.env.NOTIFICATION_URL || 'https://tbank-xp1i.onrender.com/api/webhook'
   });
 });
 
 // Запуск сервера
 app.listen(PORT, () => {
   console.log(`🚀 T-Bank Payment Server запущен на порту ${PORT}`);
-  console.log(`🌐 Доступен по адресу: http://localhost:${PORT}`);
-  console.log(`🔧 Режим: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`🌐 Webhook URL: ${process.env.NOTIFICATION_URL || 'https://tbank-xp1i.onrender.com/api/webhook'}`);
   console.log(`🔥 Firebase: ${admin.apps.length > 0 ? '✅ подключен' : '❌ не подключен'}`);
 });
