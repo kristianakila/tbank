@@ -47,8 +47,14 @@ const tbank = new TbankPayments({
  */
 async function findOrderByTbankOrderId(tbankOrderId) {
   try {
+    // Проверяем, что OrderId не пустой
+    if (!tbankOrderId) {
+      console.log('⚠️ Пустой OrderId для поиска');
+      return null;
+    }
+    
     // Создаем отдельную коллекцию для быстрого поиска
-    const orderRef = db.collection('orderMappings').doc(tbankOrderId);
+    const orderRef = db.collection('orderMappings').doc(tbankOrderId.toString());
     const orderDoc = await orderRef.get();
     
     if (orderDoc.exists) {
@@ -59,13 +65,13 @@ async function findOrderByTbankOrderId(tbankOrderId) {
         docRef: db.collection('telegramUsers')
           .doc(data.userId.toString())
           .collection('orders')
-          .doc(data.orderId)
+          .doc(data.orderId.toString())
       };
     }
     
     return null;
   } catch (error) {
-    console.error('❌ Ошибка поиска заказа:', error);
+    console.error('❌ Ошибка поиска заказа:', error.message);
     return null;
   }
 }
@@ -75,14 +81,54 @@ async function findOrderByTbankOrderId(tbankOrderId) {
  */
 async function saveOrderMapping(tbankOrderId, userId, orderId) {
   try {
-    await db.collection('orderMappings').doc(tbankOrderId).set({
-      userId: userId,
-      orderId: orderId,
+    // Проверяем, что все параметры не пустые
+    if (!tbankOrderId || !userId || !orderId) {
+      console.error('❌ Ошибка: пустые параметры для маппинга');
+      return;
+    }
+    
+    await db.collection('orderMappings').doc(tbankOrderId.toString()).set({
+      userId: userId.toString(),
+      orderId: orderId.toString(),
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
     console.log(`✅ Маппинг сохранен: ${tbankOrderId} -> ${userId}/${orderId}`);
   } catch (error) {
     console.error('❌ Ошибка сохранения маппинга:', error);
+  }
+}
+
+/**
+ * Ищет заказ по OrderId в специальной коллекции для быстрого поиска
+ */
+async function findOrderByTbankOrderId(tbankOrderId) {
+  try {
+    // Проверяем, что OrderId не пустой
+    if (!tbankOrderId) {
+      console.log('⚠️ Пустой OrderId для поиска');
+      return null;
+    }
+    
+    // Создаем отдельную коллекцию для быстрого поиска
+    const orderRef = db.collection('orderMappings').doc(tbankOrderId.toString());
+    const orderDoc = await orderRef.get();
+    
+    if (orderDoc.exists) {
+      const data = orderDoc.data();
+      return {
+        userId: data.userId,
+        orderId: data.orderId,
+        docRef: db.collection('telegramUsers')
+          .doc(data.userId.toString())
+          .collection('orders')
+          .doc(data.orderId.toString())
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('❌ Ошибка поиска заказа:', error.message);
+    return null;
   }
 }
 
@@ -232,6 +278,11 @@ app.post('/api/webhook', async (req, res) => {
       webhookData = req.body;
     }
     
+    // Преобразуем числа в строки для Firebase
+    if (webhookData.PaymentId) webhookData.PaymentId = webhookData.PaymentId.toString();
+    if (webhookData.RebillId) webhookData.RebillId = webhookData.RebillId.toString();
+    if (webhookData.CardId) webhookData.CardId = webhookData.CardId.toString();
+    
     console.log('📨 ВЕБХУК: Parsed data:', JSON.stringify(webhookData, null, 2));
     
     const {
@@ -294,18 +345,59 @@ app.post('/api/webhook', async (req, res) => {
           
           // Сохраняем для ручной обработки
           try {
+            // Используем PaymentId как строку или создаем безопасный ID
+            const docId = PaymentId || `unknown_${Date.now()}`;
+            
             await db.collection('pendingWebhooks')
-              .doc(PaymentId || `unknown_${Date.now()}`)
+              .doc(docId.toString()) // Явно приводим к строке
               .set({
                 webhookData: webhookData,
                 receivedAt: admin.firestore.FieldValue.serverTimestamp(),
                 processed: false,
-                orderId: OrderId
+                orderId: OrderId,
+                paymentId: PaymentId
               });
             
-            console.log('✅ ВЕБХУК: Вебхук сохранен для ручной обработки');
+            console.log(`✅ ВЕБХУК: Вебхук сохранен для ручной обработки (ID: ${docId})`);
+            
+            // Попробуем найти по PaymentId в orders (прямой поиск)
+            if (PaymentId) {
+              console.log(`🔍 Пытаемся найти заказ по PaymentId: ${PaymentId} напрямую...`);
+              
+              // Ищем во всех заказах пользователя 272401691 (ваш тестовый userId)
+              const userId = '272401691'; // Ваш тестовый userId
+              const ordersRef = db.collection('telegramUsers')
+                .doc(userId)
+                .collection('orders');
+              
+              const querySnapshot = await ordersRef
+                .where('paymentId', '==', PaymentId)
+                .limit(1)
+                .get();
+              
+              if (!querySnapshot.empty) {
+                const orderDoc = querySnapshot.docs[0];
+                console.log(`✅ Найден заказ напрямую: ${orderDoc.id}`);
+                
+                // Обновляем найденный заказ
+                const rebillId = await updatePaymentFromWebhook(
+                  userId,
+                  orderDoc.id,
+                  webhookData
+                );
+                
+                if (rebillId) {
+                  // Сохраняем маппинг для будущих вебхуков
+                  await saveOrderMapping(OrderId, userId, orderDoc.id);
+                  await saveUserSubscription(userId, webhookData, rebillId);
+                }
+              } else {
+                console.log('⚠️ Заказ не найден даже по прямому поиску');
+              }
+            }
+            
           } catch (saveError) {
-            console.error('❌ ВЕБХУК: Ошибка сохранения:', saveError);
+            console.error('❌ ВЕБХУК: Ошибка сохранения:', saveError.message);
           }
         }
         
@@ -315,7 +407,7 @@ app.post('/api/webhook', async (req, res) => {
         console.error('❌ ВЕБХУК: Ошибка асинхронной обработки:', asyncError.message);
         console.error('❌ ВЕБХУК: Stack:', asyncError.stack);
       }
-    }, 100); // Небольшая задержка для гарантии ответа T-Bank
+    }, 100);
     
   } catch (error) {
     console.error('❌ ВЕБХУК: Критическая ошибка:', error.message);
