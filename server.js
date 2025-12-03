@@ -43,27 +43,23 @@ const tbank = new TbankPayments({
 
 // ========== ПОМОЩНИКИ ДЛЯ FIREBASE ==========
 /**
- * Находит документ заказа в Firebase по OrderId T-Bank
+ * Ищет заказ по OrderId в специальной коллекции для быстрого поиска
  */
 async function findOrderByTbankOrderId(tbankOrderId) {
   try {
-    // Ищем во всех коллекциях orders всех пользователей
-    const ordersQuery = await db.collectionGroup('orders')
-      .where('tinkoff.OrderId', '==', tbankOrderId)
-      .limit(1)
-      .get();
+    // Создаем отдельную коллекцию для быстрого поиска
+    const orderRef = db.collection('orderMappings').doc(tbankOrderId);
+    const orderDoc = await orderRef.get();
     
-    if (!ordersQuery.empty) {
-      const orderDoc = ordersQuery.docs[0];
-      const userId = orderDoc.ref.parent.parent.id;
-      const orderId = orderDoc.id;
-      const orderData = orderDoc.data();
-      
+    if (orderDoc.exists) {
+      const data = orderDoc.data();
       return {
-        userId,
-        orderId,
-        orderData,
-        docRef: orderDoc.ref
+        userId: data.userId,
+        orderId: data.orderId,
+        docRef: db.collection('telegramUsers')
+          .doc(data.userId.toString())
+          .collection('orders')
+          .doc(data.orderId)
       };
     }
     
@@ -75,34 +71,18 @@ async function findOrderByTbankOrderId(tbankOrderId) {
 }
 
 /**
- * Находит документ заказа по PaymentId T-Bank
+ * Сохраняет маппинг OrderId -> userId/orderId для быстрого поиска
  */
-async function findOrderByPaymentId(paymentId) {
+async function saveOrderMapping(tbankOrderId, userId, orderId) {
   try {
-    // Ищем по paymentId
-    const ordersQuery = await db.collectionGroup('orders')
-      .where('tinkoff.PaymentId', '==', paymentId)
-      .limit(1)
-      .get();
-    
-    if (!ordersQuery.empty) {
-      const orderDoc = ordersQuery.docs[0];
-      const userId = orderDoc.ref.parent.parent.id;
-      const orderId = orderDoc.id;
-      const orderData = orderDoc.data();
-      
-      return {
-        userId,
-        orderId,
-        orderData,
-        docRef: orderDoc.ref
-      };
-    }
-    
-    return null;
+    await db.collection('orderMappings').doc(tbankOrderId).set({
+      userId: userId,
+      orderId: orderId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    console.log(`✅ Маппинг сохранен: ${tbankOrderId} -> ${userId}/${orderId}`);
   } catch (error) {
-    console.error('❌ Ошибка поиска заказа по PaymentId:', error);
-    return null;
+    console.error('❌ Ошибка сохранения маппинга:', error);
   }
 }
 
@@ -129,6 +109,7 @@ async function updatePaymentFromWebhook(userId, orderId, webhookData) {
       'tinkoff.Status': Status,
       'tinkoff.Success': Success,
       'tinkoff.Amount': Amount,
+      'tinkoff.PaymentId': PaymentId,
       status: Status,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
@@ -147,11 +128,12 @@ async function updatePaymentFromWebhook(userId, orderId, webhookData) {
     }
     
     // Обновляем документ
-    await db.collection('telegramUsers')
+    const docRef = db.collection('telegramUsers')
       .doc(userId.toString())
       .collection('orders')
-      .doc(orderId)
-      .update(updateData);
+      .doc(orderId);
+    
+    await docRef.update(updateData);
     
     console.log(`✅ Платеж обновлен из вебхука: userId=${userId}, orderId=${orderId}`);
     console.log(`📊 Статус: ${Status}, RebillId: ${RebillId || 'не получен'}`);
@@ -159,7 +141,63 @@ async function updatePaymentFromWebhook(userId, orderId, webhookData) {
     return RebillId;
   } catch (error) {
     console.error('❌ Ошибка обновления из вебхука:', error.message);
-    return null;
+    
+    // Попробуем создать документ, если его нет
+    try {
+      const docRef = db.collection('telegramUsers')
+        .doc(userId.toString())
+        .collection('orders')
+        .doc(orderId);
+      
+      await docRef.set({
+        tinkoff: webhookData,
+        status: webhookData.Status || 'UNKNOWN',
+        amount: webhookData.Amount ? webhookData.Amount / 100 : 0,
+        paymentId: webhookData.PaymentId,
+        orderId: orderId,
+        rebillId: webhookData.RebillId || null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        ...(webhookData.RebillId && { finishedAt: admin.firestore.FieldValue.serverTimestamp() })
+      });
+      
+      console.log(`✅ Создан новый документ из вебхука: ${userId}/${orderId}`);
+      return webhookData.RebillId;
+    } catch (createError) {
+      console.error('❌ Не удалось создать документ:', createError);
+      return null;
+    }
+  }
+}
+
+/**
+ * Сохраняет подписку пользователя
+ */
+async function saveUserSubscription(userId, webhookData, rebillId) {
+  try {
+    const { CardId, Pan } = webhookData;
+    
+    const subscriptionData = {
+      rebillId: rebillId,
+      cardLastDigits: Pan ? Pan.slice(-4) : null,
+      cardId: CardId,
+      status: 'active',
+      lastPayment: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      webhookData: webhookData
+    };
+    
+    await db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('subscriptions')
+      .doc('active')
+      .set(subscriptionData, { merge: true });
+    
+    console.log(`✅ Подписка сохранена для userId=${userId}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Ошибка сохранения подписки:', error);
+    return false;
   }
 }
 // =============================================
@@ -228,14 +266,9 @@ app.post('/api/webhook', async (req, res) => {
         
         let orderInfo = null;
         
-        // Пытаемся найти заказ по OrderId
+        // Пытаемся найти заказ по OrderId через маппинг
         if (OrderId) {
           orderInfo = await findOrderByTbankOrderId(OrderId);
-        }
-        
-        // Если не нашли по OrderId, ищем по PaymentId
-        if (!orderInfo && PaymentId) {
-          orderInfo = await findOrderByPaymentId(PaymentId);
         }
         
         if (orderInfo) {
@@ -251,47 +284,28 @@ app.post('/api/webhook', async (req, res) => {
           if (rebillId) {
             console.log(`🎉 ВЕБХУК: RebillId сохранен: ${rebillId}`);
             
-            // Можно отправить уведомление пользователю или в другую систему
-            // Например, сохранить rebillId в отдельную коллекцию для подписок
-            if (orderInfo.userId && rebillId) {
-              try {
-                await db.collection('telegramUsers')
-                  .doc(orderInfo.userId.toString())
-                  .collection('subscriptions')
-                  .doc('active')
-                  .set({
-                    rebillId: rebillId,
-                    cardLastDigits: Pan ? Pan.slice(-4) : null,
-                    cardId: CardId,
-                    status: 'active',
-                    lastPayment: admin.firestore.FieldValue.serverTimestamp(),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                  }, { merge: true });
-                
-                console.log(`✅ ВЕБХУК: Подписка сохранена для userId=${orderInfo.userId}`);
-              } catch (subscriptionError) {
-                console.error('❌ ВЕБХУК: Ошибка сохранения подписки:', subscriptionError);
-              }
-            }
+            // Сохраняем подписку пользователя
+            await saveUserSubscription(orderInfo.userId, webhookData, rebillId);
           }
         } else {
-          console.log('⚠️ ВЕБХУК: Заказ не найден в Firebase');
+          console.log('⚠️ ВЕБХУК: Заказ не найден в маппингах');
           console.log('   OrderId:', OrderId);
           console.log('   PaymentId:', PaymentId);
           
-          // Можно создать новый документ для неопознанных платежей
+          // Сохраняем для ручной обработки
           try {
-            await db.collection('unknownPayments')
+            await db.collection('pendingWebhooks')
               .doc(PaymentId || `unknown_${Date.now()}`)
               .set({
                 webhookData: webhookData,
                 receivedAt: admin.firestore.FieldValue.serverTimestamp(),
-                processed: false
+                processed: false,
+                orderId: OrderId
               });
             
-            console.log('✅ ВЕБХУК: Неизвестный платеж сохранен для ручной обработки');
+            console.log('✅ ВЕБХУК: Вебхук сохранен для ручной обработки');
           } catch (saveError) {
-            console.error('❌ ВЕБХУК: Ошибка сохранения неизвестного платежа:', saveError);
+            console.error('❌ ВЕБХУК: Ошибка сохранения:', saveError);
           }
         }
         
@@ -414,6 +428,10 @@ app.post('/api/init-recurrent', async (req, res) => {
         
         firebaseId = orderId;
         console.log(`✅ Данные сохранены в Firebase: userId=${userId}, orderId=${orderId}`);
+        
+        // Сохраняем маппинг для быстрого поиска вебхуком
+        await saveOrderMapping(tbankOrderId, userId, orderId);
+        
       } catch (firebaseError) {
         console.error('❌ Ошибка сохранения в Firebase:', firebaseError);
       }
@@ -531,6 +549,10 @@ app.post('/api/run-payment', async (req, res) => {
           }, { merge: true });
         
         firebaseId = orderId;
+        
+        // Сохраняем маппинг для этого платежа тоже
+        await saveOrderMapping(tbankOrderId, userId, orderId);
+        
       } catch (firebaseError) {
         console.error('❌ Ошибка сохранения в Firebase:', firebaseError);
       }
@@ -569,6 +591,34 @@ app.post('/api/run-payment', async (req, res) => {
       error: error.message || 'Unknown error',
       code: error.code,
       details: error.details || error.response?.data || null
+    });
+  }
+});
+
+// Эндпоинт для ручной привязки вебхука к заказу
+app.post('/api/link-webhook', async (req, res) => {
+  try {
+    const { tbankOrderId, userId, orderId } = req.body;
+    
+    if (!tbankOrderId || !userId || !orderId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Необходимо указать tbankOrderId, userId и orderId'
+      });
+    }
+
+    await saveOrderMapping(tbankOrderId, userId, orderId);
+    
+    res.json({
+      success: true,
+      message: `Маппинг создан: ${tbankOrderId} -> ${userId}/${orderId}`
+    });
+    
+  } catch (error) {
+    console.error('❌ Ошибка создания маппинга:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
     });
   }
 });
