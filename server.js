@@ -244,12 +244,14 @@ async function restoreScheduledJobs() {
   console.log('🔍 Восстанавливаю запланированные платежи...');
   
   try {
-    const subscriptionsSnapshot = await db.collectionGroup('subscriptions')
-      .where('status', '==', 'active')
-      .where('nextPaymentDate', '>', new Date().toISOString())
-      .get();
+    // ВАЖНО: Firebase требует индекс для запросов collectionGroup с несколькими условиями
+    // Временно используем упрощенный запрос
+    
+    // Альтернативный подход 1: Получаем ВСЕ подписки и фильтруем локально
+    const subscriptionsSnapshot = await db.collectionGroup('subscriptions').get();
     
     let restoredCount = 0;
+    const now = new Date();
     
     for (const doc of subscriptionsSnapshot.docs) {
       try {
@@ -257,26 +259,65 @@ async function restoreScheduledJobs() {
         const userId = doc.ref.parent.parent.id;
         const subscriptionId = doc.id;
         
-        const jobId = scheduleSubscriptionPayment(userId, {
-          ...subscriptionData,
-          subscriptionId
-        });
-        
-        if (jobId) {
-          restoredCount++;
-          console.log(`✅ Восстановлено расписание для пользователя ${userId}, подписка ${subscriptionId}`);
+        // Проверяем условия локально
+        if (subscriptionData.status === 'active' && 
+            subscriptionData.nextPaymentDate &&
+            new Date(subscriptionData.nextPaymentDate) > now) {
+          
+          const jobId = scheduleSubscriptionPayment(userId, {
+            ...subscriptionData,
+            subscriptionId
+          });
+          
+          if (jobId) {
+            restoredCount++;
+            console.log(`✅ Восстановлено расписание для пользователя ${userId}, подписка ${subscriptionId}`);
+          }
         }
       } catch (error) {
         console.error(`❌ Ошибка восстановления подписки ${doc.id}:`, error);
       }
     }
     
-    console.log(`✅ Восстановлено ${restoredCount} запланированных платежей`);
+    console.log(`✅ Восстановлено ${restoredCount} запланированных платежей из ${subscriptionsSnapshot.size} найденных подписок`);
+    
   } catch (error) {
-    console.error('❌ Ошибка при восстановлении расписания:', error);
+    console.error('❌ Ошибка при восстановлении расписания:', error.message);
+    
+    // Альтернативный подход 2: Временная обходная версия для отладки
+    console.log('🔄 Использую альтернативный метод восстановления...');
+    
+    try {
+      // Получаем подписки для конкретного тестового пользователя (если есть)
+      const testUserId = '272401691';
+      const subscriptionsRef = db.collection('telegramUsers')
+        .doc(testUserId)
+        .collection('subscriptions');
+      
+      const snapshot = await subscriptionsRef.get();
+      
+      let altRestoredCount = 0;
+      
+      snapshot.forEach(doc => {
+        const subscriptionData = doc.data();
+        if (subscriptionData.status === 'active' && subscriptionData.nextPaymentDate) {
+          const jobId = scheduleSubscriptionPayment(testUserId, {
+            ...subscriptionData,
+            subscriptionId: doc.id
+          });
+          
+          if (jobId) {
+            altRestoredCount++;
+          }
+        }
+      });
+      
+      console.log(`✅ Альтернативно восстановлено ${altRestoredCount} платежей для тестового пользователя`);
+    } catch (altError) {
+      console.error('❌ Ошибка альтернативного восстановления:', altError.message);
+    }
   }
 }
-// =============================================
 
 // ========== ПОМОЩНИКИ ДЛЯ FIREBASE ==========
 /**
