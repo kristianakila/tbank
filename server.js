@@ -36,9 +36,9 @@ const TbankPayments = require('tbank-payments');
 
 // Инициализация T-Bank клиента
 const tbank = new TbankPayments({
-  merchantId: process.env.TBANK_MERCHANT_ID || '1691507148627',
-  secret: process.env.TBANK_SECRET || 'rlkzhollw74x8uvv',
-  apiUrl: process.env.TBANK_API_URL || 'https://securepay.tinkoff.ru'
+  merchantId: process.env.TBANK_MERCHANT_ID,
+  secret: process.env.TBANK_SECRET,
+  apiUrl: process.env.TBANK_API_URL
 });
 
 // ========== ПОМОЩНИКИ ДЛЯ FIREBASE ==========
@@ -424,6 +424,103 @@ app.use((req, res, next) => {
   next();
 });
 
+
+// =============================================
+// Эндпоинт для создания обычного разового платежа
+// =============================================
+app.post('/api/init-once', async (req, res) => {
+  try {
+    const { amount, email, phone, description, userId, orderId } = req.body;
+
+    if (!amount || !email || !userId || !orderId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Необходимо указать amount, email, userId, orderId'
+      });
+    }
+
+    console.log('🚀 Инициализация разового платежа');
+    console.log('userId:', userId, 'orderId:', orderId);
+
+    // ---------- ЧЕК ----------
+    const receipt = {
+      Email: email,
+      Phone: phone || '+79001234567',
+      Taxation: 'osn',
+      Items: [
+        {
+          Name: description || 'Разовая покупка',
+          Price: amount * 100,
+          Quantity: 1,
+          Amount: amount * 100,
+          Tax: 'vat20',
+          PaymentMethod: 'full_payment',
+          PaymentObject: 'service'
+        }
+      ]
+    };
+
+    const tbankOrderId = `once-${Date.now()}`;
+
+    // ---------- ПЛАТЁЖ ----------
+    const payment = await req.tbank.initPayment({
+      Amount: amount * 100,
+      OrderId: tbankOrderId,
+      Description: description || 'Разовый платеж',
+      NotificationURL: process.env.NOTIFICATION_URL || 'https://tbank-xp1i.onrender.com/api/webhook',
+      Receipt: receipt
+    });
+
+    console.log('💳 Разовый платеж создан. PaymentId:', payment.PaymentId);
+
+    // ---------- СОХРАНЕНИЕ В FIREBASE ----------
+    await db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('orders2')
+      .doc(orderId.toString())
+      .set({
+        tinkoff: {
+          ...payment,
+          Amount: amount * 100,
+          OrderId: tbankOrderId,
+          PaymentId: payment.PaymentId
+        },
+        status: 'INITIATED',
+        amount: amount,
+        paymentId: payment.PaymentId,
+        orderId: orderId,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+    console.log(`✅ Разовый платеж сохранён в Firebase: userId=${userId}, orderId=${orderId}`);
+
+    // ---------- МАППИНГ ДЛЯ ВЕБХУКА ----------
+    await saveOrderMapping(tbankOrderId, userId, orderId);
+
+    res.json({
+      success: true,
+      paymentId: payment.PaymentId,
+      paymentUrl: payment.PaymentURL,
+      orderId: tbankOrderId,
+      firebaseId: orderId,
+      message: 'Перейдите по URL для оплаты. После оплаты вебхук обновит статус платежа.'
+    });
+
+  } catch (error) {
+    console.error('❌ Ошибка разового платежа:', error.message);
+    if (error.response) console.error('Детали:', error.response.data);
+
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      details: error.response?.data || null
+    });
+  }
+});
+
+
+
 // Эндпоинт для инициализации рекуррентного платежа
 app.post('/api/init-recurrent', async (req, res) => {
   try {
@@ -683,34 +780,6 @@ app.post('/api/run-payment', async (req, res) => {
       error: error.message || 'Unknown error',
       code: error.code,
       details: error.details || error.response?.data || null
-    });
-  }
-});
-
-// Эндпоинт для ручной привязки вебхука к заказу
-app.post('/api/link-webhook', async (req, res) => {
-  try {
-    const { tbankOrderId, userId, orderId } = req.body;
-    
-    if (!tbankOrderId || !userId || !orderId) {
-      return res.status(400).json({
-        success: false,
-        error: 'Необходимо указать tbankOrderId, userId и orderId'
-      });
-    }
-
-    await saveOrderMapping(tbankOrderId, userId, orderId);
-    
-    res.json({
-      success: true,
-      message: `Маппинг создан: ${tbankOrderId} -> ${userId}/${orderId}`
-    });
-    
-  } catch (error) {
-    console.error('❌ Ошибка создания маппинга:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
     });
   }
 });
