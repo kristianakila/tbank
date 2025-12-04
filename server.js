@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
+const schedule = require('node-schedule');
 require('dotenv').config();
 
 const app = express();
@@ -41,19 +42,253 @@ const tbank = new TbankPayments({
   apiUrl: process.env.TBANK_API_URL
 });
 
+// ========== СИСТЕМА ПЛАНИРОВАНИЯ ==========
+const scheduledJobs = new Map();
+
+/**
+ * Расписание для автоматического списания подписки
+ */
+function scheduleSubscriptionPayment(userId, subscriptionData) {
+  const { nextPaymentDate, amount, rebillId, email, subscriptionId } = subscriptionData;
+  
+  if (!nextPaymentDate || !rebillId) {
+    console.error('❌ Недостаточно данных для планирования');
+    return null;
+  }
+
+  const jobId = `sub_${userId}_${subscriptionId}`;
+  
+  // Отменяем предыдущее задание, если оно существует
+  if (scheduledJobs.has(jobId)) {
+    scheduledJobs.get(jobId).cancel();
+    scheduledJobs.delete(jobId);
+    console.log(`🗑️ Отменено предыдущее задание для ${jobId}`);
+  }
+
+  const paymentDate = new Date(nextPaymentDate);
+  
+  // Проверяем, что дата в будущем
+  if (paymentDate <= new Date()) {
+    console.error('❌ Дата платежа должна быть в будущем');
+    return null;
+  }
+
+  // Создаем задание для списания
+  const job = schedule.scheduleJob(paymentDate, async () => {
+    console.log(`⏰ Выполняю автоматическое списание для пользователя ${userId}`);
+    
+    try {
+      // Выполняем платеж
+      await executeRecurrentPayment({
+        userId,
+        rebillId,
+        amount,
+        email,
+        description: 'Автоматическое списание по подписке',
+        subscriptionId
+      });
+      
+      // Планируем следующий платеж через месяц
+      const nextDate = new Date(paymentDate);
+      nextDate.setMonth(nextDate.getMonth() + 1);
+      
+      // Обновляем подписку
+      await db.collection('telegramUsers')
+        .doc(userId.toString())
+        .collection('subscriptions')
+        .doc(subscriptionId)
+        .update({
+          nextPaymentDate: nextDate.toISOString(),
+          lastScheduledPayment: new Date().toISOString(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      
+      // Планируем следующий платеж
+      scheduleSubscriptionPayment(userId, {
+        ...subscriptionData,
+        nextPaymentDate: nextDate.toISOString()
+      });
+      
+      console.log(`✅ Следующий платеж запланирован на ${nextDate.toISOString()}`);
+    } catch (error) {
+      console.error(`❌ Ошибка автоматического списания для ${userId}:`, error);
+      
+      // Отмечаем неудачную попытку
+      await db.collection('telegramUsers')
+        .doc(userId.toString())
+        .collection('subscriptions')
+        .doc(subscriptionId)
+        .update({
+          'paymentFailures': admin.firestore.FieldValue.arrayUnion({
+            date: new Date().toISOString(),
+            error: error.message
+          }),
+          status: 'payment_failed',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+    }
+  });
+
+  scheduledJobs.set(jobId, job);
+  console.log(`✅ Платеж запланирован для ${userId} на ${paymentDate.toISOString()}`);
+  
+  return jobId;
+}
+
+/**
+ * Выполнение рекуррентного платежа
+ */
+async function executeRecurrentPayment(params) {
+  const { userId, rebillId, amount, email, description, subscriptionId } = params;
+  
+  try {
+    const orderId = `recurrent-auto-${Date.now()}-${userId}`;
+    
+    // Создаем чек
+    const receipt = {
+      Email: email,
+      Phone: '+79001234567',
+      Taxation: 'osn',
+      Items: [
+        {
+          Name: description || 'Автоматическое списание по подписке',
+          Price: amount * 100,
+          Quantity: 1,
+          Amount: amount * 100,
+          Tax: 'vat20',
+          PaymentMethod: 'full_payment',
+          PaymentObject: 'service'
+        }
+      ]
+    };
+
+    // Создаем новый платеж
+    const newPayment = await tbank.initPayment({
+      Amount: amount * 100,
+      OrderId: orderId,
+      Description: description || 'Автоматическое списание по подписке',
+      Receipt: receipt,
+    });
+
+    console.log(`✅ Платеж создан. PaymentId: ${newPayment.PaymentId}`);
+
+    // Проводим списание
+    const chargeResult = await tbank.chargeRecurrent({
+      PaymentId: newPayment.PaymentId,
+      RebillId: rebillId,
+    });
+
+    console.log(`✅ Списание выполнено. Успех: ${chargeResult.Success}, Статус: ${chargeResult.Status}`);
+
+    // Сохраняем результат платежа
+    await db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('orders')
+      .doc(orderId)
+      .set({
+        tinkoff: {
+          ...chargeResult,
+          RebillId: rebillId,
+          Amount: amount * 100,
+          PaymentId: newPayment.PaymentId,
+          OrderId: orderId
+        },
+        type: 'recurrent_auto',
+        status: chargeResult.Status,
+        amount: amount,
+        paymentId: newPayment.PaymentId,
+        orderId: orderId,
+        rebillId: rebillId,
+        subscriptionId: subscriptionId,
+        success: chargeResult.Success,
+        finishedAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+
+    // Обновляем статус подписки
+    if (chargeResult.Success) {
+      await db.collection('telegramUsers')
+        .doc(userId.toString())
+        .collection('subscriptions')
+        .doc(subscriptionId)
+        .update({
+          lastSuccessfulPayment: new Date().toISOString(),
+          totalPaid: admin.firestore.FieldValue.increment(amount),
+          paymentHistory: admin.firestore.FieldValue.arrayUnion({
+            date: new Date().toISOString(),
+            amount: amount,
+            paymentId: newPayment.PaymentId,
+            orderId: orderId,
+            status: 'success'
+          }),
+          status: 'active',
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      
+      console.log(`✅ Платеж успешно выполнен и сохранен для ${userId}`);
+      return { success: true, paymentId: newPayment.PaymentId };
+    } else {
+      throw new Error(`Ошибка списания: ${chargeResult.Message || 'Unknown error'}`);
+    }
+  } catch (error) {
+    console.error(`❌ Ошибка выполнения платежа для ${userId}:`, error);
+    throw error;
+  }
+}
+
+/**
+ * Восстановление расписания при запуске сервера
+ */
+async function restoreScheduledJobs() {
+  console.log('🔍 Восстанавливаю запланированные платежи...');
+  
+  try {
+    const subscriptionsSnapshot = await db.collectionGroup('subscriptions')
+      .where('status', '==', 'active')
+      .where('nextPaymentDate', '>', new Date().toISOString())
+      .get();
+    
+    let restoredCount = 0;
+    
+    for (const doc of subscriptionsSnapshot.docs) {
+      try {
+        const subscriptionData = doc.data();
+        const userId = doc.ref.parent.parent.id;
+        const subscriptionId = doc.id;
+        
+        const jobId = scheduleSubscriptionPayment(userId, {
+          ...subscriptionData,
+          subscriptionId
+        });
+        
+        if (jobId) {
+          restoredCount++;
+          console.log(`✅ Восстановлено расписание для пользователя ${userId}, подписка ${subscriptionId}`);
+        }
+      } catch (error) {
+        console.error(`❌ Ошибка восстановления подписки ${doc.id}:`, error);
+      }
+    }
+    
+    console.log(`✅ Восстановлено ${restoredCount} запланированных платежей`);
+  } catch (error) {
+    console.error('❌ Ошибка при восстановлении расписания:', error);
+  }
+}
+// =============================================
+
 // ========== ПОМОЩНИКИ ДЛЯ FIREBASE ==========
 /**
  * Ищет заказ по OrderId в специальной коллекции для быстрого поиска
  */
 async function findOrderByTbankOrderId(tbankOrderId) {
   try {
-    // Проверяем, что OrderId не пустой
     if (!tbankOrderId) {
       console.log('⚠️ Пустой OrderId для поиска');
       return null;
     }
     
-    // Создаем отдельную коллекцию для быстрого поиска
     const orderRef = db.collection('orderMappings').doc(tbankOrderId.toString());
     const orderDoc = await orderRef.get();
     
@@ -81,7 +316,6 @@ async function findOrderByTbankOrderId(tbankOrderId) {
  */
 async function saveOrderMapping(tbankOrderId, userId, orderId) {
   try {
-    // Проверяем, что все параметры не пустые
     if (!tbankOrderId || !userId || !orderId) {
       console.error('❌ Ошибка: пустые параметры для маппинга');
       return;
@@ -95,40 +329,6 @@ async function saveOrderMapping(tbankOrderId, userId, orderId) {
     console.log(`✅ Маппинг сохранен: ${tbankOrderId} -> ${userId}/${orderId}`);
   } catch (error) {
     console.error('❌ Ошибка сохранения маппинга:', error);
-  }
-}
-
-/**
- * Ищет заказ по OrderId в специальной коллекции для быстрого поиска
- */
-async function findOrderByTbankOrderId(tbankOrderId) {
-  try {
-    // Проверяем, что OrderId не пустой
-    if (!tbankOrderId) {
-      console.log('⚠️ Пустой OrderId для поиска');
-      return null;
-    }
-    
-    // Создаем отдельную коллекцию для быстрого поиска
-    const orderRef = db.collection('orderMappings').doc(tbankOrderId.toString());
-    const orderDoc = await orderRef.get();
-    
-    if (orderDoc.exists) {
-      const data = orderDoc.data();
-      return {
-        userId: data.userId,
-        orderId: data.orderId,
-        docRef: db.collection('telegramUsers')
-          .doc(data.userId.toString())
-          .collection('orders')
-          .doc(data.orderId.toString())
-      };
-    }
-    
-    return null;
-  } catch (error) {
-    console.error('❌ Ошибка поиска заказа:', error.message);
-    return null;
   }
 }
 
@@ -160,7 +360,6 @@ async function updatePaymentFromWebhook(userId, orderId, webhookData) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
     
-    // Добавляем RebillId если есть
     if (RebillId) {
       updateData.rebillId = RebillId;
       updateData['tinkoff.RebillId'] = RebillId;
@@ -168,12 +367,10 @@ async function updatePaymentFromWebhook(userId, orderId, webhookData) {
       console.log(`🔄 RebillId получен: ${RebillId}`);
     }
     
-    // Добавляем CardId если есть
     if (CardId) {
       updateData['tinkoff.CardId'] = CardId;
     }
     
-    // Обновляем документ
     const docRef = db.collection('telegramUsers')
       .doc(userId.toString())
       .collection('orders')
@@ -188,7 +385,6 @@ async function updatePaymentFromWebhook(userId, orderId, webhookData) {
   } catch (error) {
     console.error('❌ Ошибка обновления из вебхука:', error.message);
     
-    // Попробуем создать документ, если его нет
     try {
       const docRef = db.collection('telegramUsers')
         .doc(userId.toString())
@@ -217,32 +413,91 @@ async function updatePaymentFromWebhook(userId, orderId, webhookData) {
 }
 
 /**
- * Сохраняет подписку пользователя
+ * Сохраняет подписку пользователя и планирует автоматические списания
  */
-async function saveUserSubscription(userId, webhookData, rebillId) {
+async function saveUserSubscription(userId, webhookData, rebillId, amount = 390) {
   try {
-    const { CardId, Pan } = webhookData;
+    const { CardId, Pan, Amount, OrderId } = webhookData;
+    
+    // Рассчитываем даты
+    const now = new Date();
+    const nextPaymentDate = new Date(now);
+    nextPaymentDate.setMonth(nextPaymentDate.getMonth() + 1);
     
     const subscriptionData = {
       rebillId: rebillId,
       cardLastDigits: Pan ? Pan.slice(-4) : null,
       cardId: CardId,
       status: 'active',
-      lastPayment: admin.firestore.FieldValue.serverTimestamp(),
+      amount: amount,
+      initialPaymentDate: now.toISOString(),
+      nextPaymentDate: nextPaymentDate.toISOString(),
+      lastSuccessfulPayment: now.toISOString(),
+      totalPaid: amount,
+      paymentHistory: [{
+        date: now.toISOString(),
+        amount: amount,
+        paymentId: webhookData.PaymentId,
+        orderId: OrderId,
+        status: 'success'
+      }],
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       webhookData: webhookData
     };
     
+    const subscriptionId = `sub_${Date.now()}`;
+    
     await db.collection('telegramUsers')
       .doc(userId.toString())
       .collection('subscriptions')
-      .doc('active')
-      .set(subscriptionData, { merge: true });
+      .doc(subscriptionId)
+      .set(subscriptionData);
     
-    console.log(`✅ Подписка сохранена для userId=${userId}`);
-    return true;
+    console.log(`✅ Подписка сохранена для userId=${userId}, subscriptionId=${subscriptionId}`);
+    
+    // Планируем автоматическое списание
+    scheduleSubscriptionPayment(userId, {
+      ...subscriptionData,
+      subscriptionId,
+      email: webhookData.Email || 'user@example.com'
+    });
+    
+    return { subscriptionId, nextPaymentDate: nextPaymentDate.toISOString() };
   } catch (error) {
     console.error('❌ Ошибка сохранения подписки:', error);
+    return false;
+  }
+}
+
+/**
+ * Отменяет подписку пользователя
+ */
+async function cancelUserSubscription(userId, subscriptionId) {
+  try {
+    const subscriptionRef = db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('subscriptions')
+      .doc(subscriptionId);
+    
+    await subscriptionRef.update({
+      status: 'cancelled',
+      cancelledAt: new Date().toISOString(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    // Отменяем запланированный платеж
+    const jobId = `sub_${userId}_${subscriptionId}`;
+    if (scheduledJobs.has(jobId)) {
+      scheduledJobs.get(jobId).cancel();
+      scheduledJobs.delete(jobId);
+      console.log(`✅ Отменено запланированное списание для ${jobId}`);
+    }
+    
+    console.log(`✅ Подписка отменена: userId=${userId}, subscriptionId=${subscriptionId}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Ошибка отмены подписки:', error);
     return false;
   }
 }
@@ -258,16 +513,13 @@ app.post('/api/webhook', async (req, res) => {
   let webhookData;
   
   try {
-    // T-Bank может отправлять данные в разных форматах
     if (Buffer.isBuffer(req.body) || typeof req.body === 'string') {
-      // Парсим raw body
       const bodyString = req.body.toString();
       console.log('📨 ВЕБХУК: Raw body:', bodyString);
       
       try {
         webhookData = JSON.parse(bodyString);
       } catch (parseError) {
-        // Пробуем парсить как URL encoded
         const parsed = new URLSearchParams(bodyString);
         webhookData = {};
         for (const [key, value] of parsed.entries()) {
@@ -278,7 +530,6 @@ app.post('/api/webhook', async (req, res) => {
       webhookData = req.body;
     }
     
-    // Преобразуем числа в строки для Firebase
     if (webhookData.PaymentId) webhookData.PaymentId = webhookData.PaymentId.toString();
     if (webhookData.RebillId) webhookData.RebillId = webhookData.RebillId.toString();
     if (webhookData.CardId) webhookData.CardId = webhookData.CardId.toString();
@@ -298,7 +549,6 @@ app.post('/api/webhook', async (req, res) => {
       Token
     } = webhookData;
     
-    // Логируем важные данные
     console.log('📨 ВЕБХУК:');
     console.log(`   OrderId: ${OrderId}`);
     console.log(`   PaymentId: ${PaymentId}`);
@@ -310,14 +560,12 @@ app.post('/api/webhook', async (req, res) => {
     // ВАЖНО: Всегда возвращаем успех сразу
     res.status(200).json({ Success: true, Error: '0' });
     
-    // Асинхронно обрабатываем вебхук
     setTimeout(async () => {
       try {
         console.log('🔄 ВЕБХУК: Начинаем обработку...');
         
         let orderInfo = null;
         
-        // Пытаемся найти заказ по OrderId через маппинг
         if (OrderId) {
           orderInfo = await findOrderByTbankOrderId(OrderId);
         }
@@ -325,7 +573,6 @@ app.post('/api/webhook', async (req, res) => {
         if (orderInfo) {
           console.log(`✅ ВЕБХУК: Найден заказ: userId=${orderInfo.userId}, orderId=${orderInfo.orderId}`);
           
-          // Обновляем данные из вебхука
           const rebillId = await updatePaymentFromWebhook(
             orderInfo.userId, 
             orderInfo.orderId, 
@@ -335,21 +582,17 @@ app.post('/api/webhook', async (req, res) => {
           if (rebillId) {
             console.log(`🎉 ВЕБХУК: RebillId сохранен: ${rebillId}`);
             
-            // Сохраняем подписку пользователя
+            // Сохраняем подписку пользователя с планированием
             await saveUserSubscription(orderInfo.userId, webhookData, rebillId);
           }
         } else {
           console.log('⚠️ ВЕБХУК: Заказ не найден в маппингах');
-          console.log('   OrderId:', OrderId);
-          console.log('   PaymentId:', PaymentId);
           
-          // Сохраняем для ручной обработки
           try {
-            // Используем PaymentId как строку или создаем безопасный ID
             const docId = PaymentId || `unknown_${Date.now()}`;
             
             await db.collection('pendingWebhooks')
-              .doc(docId.toString()) // Явно приводим к строке
+              .doc(docId.toString())
               .set({
                 webhookData: webhookData,
                 receivedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -360,12 +603,10 @@ app.post('/api/webhook', async (req, res) => {
             
             console.log(`✅ ВЕБХУК: Вебхук сохранен для ручной обработки (ID: ${docId})`);
             
-            // Попробуем найти по PaymentId в orders (прямой поиск)
             if (PaymentId) {
               console.log(`🔍 Пытаемся найти заказ по PaymentId: ${PaymentId} напрямую...`);
               
-              // Ищем во всех заказах пользователя 272401691 (ваш тестовый userId)
-              const userId = '272401691'; // Ваш тестовый userId
+              const userId = '272401691';
               const ordersRef = db.collection('telegramUsers')
                 .doc(userId)
                 .collection('orders');
@@ -379,7 +620,6 @@ app.post('/api/webhook', async (req, res) => {
                 const orderDoc = querySnapshot.docs[0];
                 console.log(`✅ Найден заказ напрямую: ${orderDoc.id}`);
                 
-                // Обновляем найденный заказ
                 const rebillId = await updatePaymentFromWebhook(
                   userId,
                   orderDoc.id,
@@ -387,7 +627,6 @@ app.post('/api/webhook', async (req, res) => {
                 );
                 
                 if (rebillId) {
-                  // Сохраняем маппинг для будущих вебхуков
                   await saveOrderMapping(OrderId, userId, orderDoc.id);
                   await saveUserSubscription(userId, webhookData, rebillId);
                 }
@@ -395,23 +634,18 @@ app.post('/api/webhook', async (req, res) => {
                 console.log('⚠️ Заказ не найден даже по прямому поиску');
               }
             }
-            
           } catch (saveError) {
             console.error('❌ ВЕБХУК: Ошибка сохранения:', saveError.message);
           }
         }
         
         console.log('✅ ВЕБХУК: Обработка завершена');
-        
       } catch (asyncError) {
         console.error('❌ ВЕБХУК: Ошибка асинхронной обработки:', asyncError.message);
-        console.error('❌ ВЕБХУК: Stack:', asyncError.stack);
       }
     }, 100);
-    
   } catch (error) {
     console.error('❌ ВЕБХУК: Критическая ошибка:', error.message);
-    // Все равно возвращаем 200 OK для T-Bank
     res.status(200).json({ Success: false, Error: error.message });
   }
 });
@@ -424,10 +658,217 @@ app.use((req, res, next) => {
   next();
 });
 
+// ========== НОВЫЕ ЭНДПОИНТЫ ДЛЯ УПРАВЛЕНИЯ ПОДПИСКАМИ ==========
 
-// =============================================
-// Эндпоинт для создания обычного разового платежа
-// =============================================
+/**
+ * Получить информацию о подписке пользователя
+ */
+app.get('/api/subscription/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    
+    const subscriptionsRef = db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('subscriptions');
+    
+    const snapshot = await subscriptionsRef
+      .where('status', '==', 'active')
+      .limit(1)
+      .get();
+    
+    if (snapshot.empty) {
+      return res.json({
+        success: false,
+        hasActiveSubscription: false,
+        message: 'Активная подписка не найдена'
+      });
+    }
+    
+    const subscription = snapshot.docs[0].data();
+    const subscriptionId = snapshot.docs[0].id;
+    
+    // Проверяем запланированный платеж
+    const jobId = `sub_${userId}_${subscriptionId}`;
+    const hasScheduledJob = scheduledJobs.has(jobId);
+    
+    res.json({
+      success: true,
+      hasActiveSubscription: true,
+      subscription: {
+        ...subscription,
+        id: subscriptionId,
+        hasScheduledPayment: hasScheduledJob,
+        nextPaymentDate: subscription.nextPaymentDate
+      }
+    });
+  } catch (error) {
+    console.error('❌ Ошибка получения подписки:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Отменить подписку пользователя
+ */
+app.post('/api/subscription/cancel', async (req, res) => {
+  try {
+    const { userId, subscriptionId } = req.body;
+    
+    if (!userId || !subscriptionId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Необходимо указать userId и subscriptionId'
+      });
+    }
+    
+    const success = await cancelUserSubscription(userId, subscriptionId);
+    
+    if (success) {
+      res.json({
+        success: true,
+        message: 'Подписка успешно отменена',
+        cancelledAt: new Date().toISOString()
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'Не удалось отменить подписку'
+      });
+    }
+  } catch (error) {
+    console.error('❌ Ошибка отмены подписки:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Выполнить досрочное списание (например, для тестирования)
+ */
+app.post('/api/subscription/charge-now', async (req, res) => {
+  try {
+    const { userId, subscriptionId } = req.body;
+    
+    if (!userId || !subscriptionId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Необходимо указать userId и subscriptionId'
+      });
+    }
+    
+    const subscriptionRef = db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('subscriptions')
+      .doc(subscriptionId);
+    
+    const subscriptionDoc = await subscriptionRef.get();
+    
+    if (!subscriptionDoc.exists) {
+      return res.status(404).json({
+        success: false,
+        error: 'Подписка не найдена'
+      });
+    }
+    
+    const subscriptionData = subscriptionDoc.data();
+    
+    if (subscriptionData.status !== 'active') {
+      return res.status(400).json({
+        success: false,
+        error: 'Подписка не активна'
+      });
+    }
+    
+    if (!subscriptionData.rebillId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Не найден rebillId для списания'
+      });
+    }
+    
+    // Выполняем списание
+    const result = await executeRecurrentPayment({
+      userId,
+      rebillId: subscriptionData.rebillId,
+      amount: subscriptionData.amount || 390,
+      email: subscriptionData.email || 'user@example.com',
+      description: 'Досрочное списание по подписке',
+      subscriptionId
+    });
+    
+    if (result.success) {
+      res.json({
+        success: true,
+        message: 'Списание выполнено успешно',
+        paymentId: result.paymentId
+      });
+    } else {
+      res.status(500).json({
+        success: false,
+        error: 'Не удалось выполнить списание'
+      });
+    }
+  } catch (error) {
+    console.error('❌ Ошибка досрочного списания:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Получить все активные подписки (административный эндпоинт)
+ */
+app.get('/api/admin/subscriptions', async (req, res) => {
+  try {
+    const subscriptionsSnapshot = await db.collectionGroup('subscriptions')
+      .where('status', '==', 'active')
+      .get();
+    
+    const subscriptions = [];
+    const now = new Date();
+    
+    for (const doc of subscriptionsSnapshot.docs) {
+      const data = doc.data();
+      const userId = doc.ref.parent.parent.id;
+      const subscriptionId = doc.id;
+      
+      // Проверяем, скоро ли следующий платеж
+      const nextPayment = new Date(data.nextPaymentDate);
+      const daysUntilPayment = Math.ceil((nextPayment - now) / (1000 * 60 * 60 * 24));
+      
+      subscriptions.push({
+        userId,
+        subscriptionId,
+        ...data,
+        nextPaymentDate: data.nextPaymentDate,
+        daysUntilPayment: daysUntilPayment,
+        hasScheduledJob: scheduledJobs.has(`sub_${userId}_${subscriptionId}`)
+      });
+    }
+    
+    res.json({
+      success: true,
+      count: subscriptions.length,
+      scheduledJobs: scheduledJobs.size,
+      subscriptions: subscriptions
+    });
+  } catch (error) {
+    console.error('❌ Ошибка получения подписок:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ========== СУЩЕСТВУЮЩИЕ ЭНДПОИНТЫ ==========
 app.post('/api/init-once', async (req, res) => {
   try {
     const { amount, email, phone, description, userId, orderId } = req.body;
@@ -442,7 +883,6 @@ app.post('/api/init-once', async (req, res) => {
     console.log('🚀 Инициализация разового платежа');
     console.log('userId:', userId, 'orderId:', orderId);
 
-    // ---------- ЧЕК ----------
     const receipt = {
       Email: email,
       Phone: phone || '+79001234567',
@@ -462,7 +902,6 @@ app.post('/api/init-once', async (req, res) => {
 
     const tbankOrderId = `once-${Date.now()}`;
 
-    // ---------- ПЛАТЁЖ ----------
     const payment = await req.tbank.initPayment({
       Amount: amount * 100,
       OrderId: tbankOrderId,
@@ -473,7 +912,6 @@ app.post('/api/init-once', async (req, res) => {
 
     console.log('💳 Разовый платеж создан. PaymentId:', payment.PaymentId);
 
-    // ---------- СОХРАНЕНИЕ В FIREBASE ----------
     await db.collection('telegramUsers')
       .doc(userId.toString())
       .collection('orders2')
@@ -495,7 +933,6 @@ app.post('/api/init-once', async (req, res) => {
 
     console.log(`✅ Разовый платеж сохранён в Firebase: userId=${userId}, orderId=${orderId}`);
 
-    // ---------- МАППИНГ ДЛЯ ВЕБХУКА ----------
     await saveOrderMapping(tbankOrderId, userId, orderId);
 
     res.json({
@@ -509,8 +946,6 @@ app.post('/api/init-once', async (req, res) => {
 
   } catch (error) {
     console.error('❌ Ошибка разового платежа:', error.message);
-    if (error.response) console.error('Детали:', error.response.data);
-
     res.status(500).json({
       success: false,
       error: error.message,
@@ -519,9 +954,6 @@ app.post('/api/init-once', async (req, res) => {
   }
 });
 
-
-
-// Эндпоинт для инициализации рекуррентного платежа
 app.post('/api/init-recurrent', async (req, res) => {
   try {
     const { amount, email, phone, description, userId, orderId } = req.body;
@@ -538,7 +970,6 @@ app.post('/api/init-recurrent', async (req, res) => {
 
     const customerKey = `customer-${Date.now()}`;
     
-    // Создаем клиента
     await req.tbank.addCustomer({
       CustomerKey: customerKey,
       Email: email,
@@ -546,7 +977,6 @@ app.post('/api/init-recurrent', async (req, res) => {
     });
     console.log('✅ Клиент создан:', customerKey);
 
-    // Инициализируем привязку карты
     const cardRequest = await req.tbank.addCard({
       CustomerKey: customerKey,
       CheckType: '3DS',
@@ -554,7 +984,6 @@ app.post('/api/init-recurrent', async (req, res) => {
     
     console.log('✅ Запрос на привязку карты создан. RequestKey:', cardRequest.RequestKey);
     
-    // Создаем чек
     const receipt = {
       Email: email,
       Phone: phone || '+79001234567',
@@ -574,7 +1003,6 @@ app.post('/api/init-recurrent', async (req, res) => {
 
     const tbankOrderId = orderId || `recurrent-order-${Date.now()}`;
     
-    // Первый платеж
     const payment = await req.tbank.initPayment({
       Amount: amount * 100,
       OrderId: tbankOrderId,
@@ -589,7 +1017,6 @@ app.post('/api/init-recurrent', async (req, res) => {
 
     console.log('✅ PaymentId:', payment.PaymentId);
 
-    // Сохраняем в Firebase
     let firebaseId = null;
     if (userId && orderId) {
       try {
@@ -618,9 +1045,7 @@ app.post('/api/init-recurrent', async (req, res) => {
         firebaseId = orderId;
         console.log(`✅ Данные сохранены в Firebase: userId=${userId}, orderId=${orderId}`);
         
-        // Сохраняем маппинг для быстрого поиска вебхуком
         await saveOrderMapping(tbankOrderId, userId, orderId);
-        
       } catch (firebaseError) {
         console.error('❌ Ошибка сохранения в Firebase:', firebaseError);
       }
@@ -641,8 +1066,6 @@ app.post('/api/init-recurrent', async (req, res) => {
 
   } catch (error) {
     console.error('❌ Ошибка инициализации:', error.message);
-    if (error.response) console.error('Детали:', error.response.data);
-    
     res.status(500).json({
       success: false,
       error: error.message,
@@ -651,7 +1074,6 @@ app.post('/api/init-recurrent', async (req, res) => {
   }
 });
 
-// Эндпоинт для выполнения рекуррентного платежа
 app.post('/api/run-payment', async (req, res) => {
   try {
     const { rebillId, amount, email, description, userId, orderId } = req.body;
@@ -667,7 +1089,6 @@ app.post('/api/run-payment', async (req, res) => {
     console.log('RebillId:', rebillId);
     console.log('userId:', userId, 'orderId:', orderId);
 
-    // Создаем чек
     const receipt = {
       Email: email,
       Phone: '+79001234567',
@@ -687,7 +1108,6 @@ app.post('/api/run-payment', async (req, res) => {
 
     const tbankOrderId = orderId || `recurrent-charge-${Date.now()}`;
     
-    // Создаем новый платеж
     const newPayment = await req.tbank.initPayment({
       Amount: amount * 100,
       OrderId: tbankOrderId,
@@ -697,7 +1117,6 @@ app.post('/api/run-payment', async (req, res) => {
 
     console.log('✅ Платеж создан. PaymentId:', newPayment.PaymentId);
 
-    // Проводим списание
     const chargeResult = await req.tbank.chargeRecurrent({
       PaymentId: newPayment.PaymentId,
       RebillId: rebillId,
@@ -705,12 +1124,10 @@ app.post('/api/run-payment', async (req, res) => {
 
     console.log('✅ Списание выполнено. Успех:', chargeResult.Success, 'Статус:', chargeResult.Status);
 
-    // Проверяем итоговый статус
     const finalStatus = await req.tbank.getPaymentState({
       PaymentId: newPayment.PaymentId,
     });
 
-    // Сохраняем в Firebase
     let firebaseId = null;
     if (userId && orderId) {
       try {
@@ -739,9 +1156,7 @@ app.post('/api/run-payment', async (req, res) => {
         
         firebaseId = orderId;
         
-        // Сохраняем маппинг для этого платежа тоже
         await saveOrderMapping(tbankOrderId, userId, orderId);
-        
       } catch (firebaseError) {
         console.error('❌ Ошибка сохранения в Firebase:', firebaseError);
       }
@@ -771,10 +1186,6 @@ app.post('/api/run-payment', async (req, res) => {
   } catch (error) {
     console.error('❌ Ошибка выполнения платежа:');
     
-    if (error.code) console.log('Код ошибки:', error.code);
-    if (error.message) console.log('Сообщение:', error.message);
-    if (error.details) console.log('Детали:', error.details);
-
     res.status(500).json({
       success: false,
       error: error.message || 'Unknown error',
@@ -784,7 +1195,6 @@ app.post('/api/run-payment', async (req, res) => {
   }
 });
 
-// Эндпоинт для проверки статуса платежа
 app.post('/api/check-payment', async (req, res) => {
   try {
     const { paymentId, orderId, userId } = req.body;
@@ -800,9 +1210,6 @@ app.post('/api/check-payment', async (req, res) => {
       PaymentId: paymentId
     });
 
-    let firebaseData = null;
-    
-    // Если есть userId и orderId, обновляем Firebase
     if (userId && orderId) {
       try {
         await db.collection('telegramUsers')
@@ -828,7 +1235,6 @@ app.post('/api/check-payment', async (req, res) => {
       rebillId: status.RebillId,
       cardId: status.CardId,
       amount: status.Amount ? status.Amount / 100 : 0,
-      updated: !!firebaseData,
       data: status
     });
 
@@ -848,13 +1254,18 @@ app.get('/health', (req, res) => {
     message: 'T-Bank Payment Server is running',
     timestamp: new Date().toISOString(),
     firebase: admin.apps.length > 0 ? 'connected' : 'not connected',
+    scheduledJobs: scheduledJobs.size,
     webhookUrl: process.env.NOTIFICATION_URL || 'https://tbank-xp1i.onrender.com/api/webhook'
   });
 });
 
 // Запуск сервера
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀 T-Bank Payment Server запущен на порту ${PORT}`);
   console.log(`🌐 Webhook URL: ${process.env.NOTIFICATION_URL || 'https://tbank-xp1i.onrender.com/api/webhook'}`);
   console.log(`🔥 Firebase: ${admin.apps.length > 0 ? '✅ подключен' : '❌ не подключен'}`);
+  
+  // Восстанавливаем запланированные платежи при запуске
+  await restoreScheduledJobs();
+  console.log(`📅 Активных запланированных платежей: ${scheduledJobs.size}`);
 });
