@@ -456,11 +456,75 @@ async function updatePaymentFromWebhook(userId, orderId, webhookData) {
 /**
  * Сохраняет подписку пользователя и планирует автоматические списания
  */
+/**
+ * Сохраняет подписку пользователя и планирует автоматические списания
+ *//**
+ * Сохраняет подписку пользователя и планирует автоматические списания
+ */
 async function saveUserSubscription(userId, webhookData, rebillId, amount = 390) {
   try {
     const { CardId, Pan, Amount, OrderId } = webhookData;
     
-    // Рассчитываем даты
+    // ПРОВЕРКА: Есть ли уже активная подписка у пользователя
+    const subscriptionsRef = db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('subscriptions');
+    
+    // Ищем активные подписки с таким же rebillId или статусом active
+    const existingSubscriptions = await subscriptionsRef
+      .where('status', '==', 'active')
+      .limit(1)
+      .get();
+    
+    if (!existingSubscriptions.empty) {
+      const existingDoc = existingSubscriptions.docs[0];
+      const existingData = existingDoc.data();
+      
+      // Если уже есть активная подписка с таким же rebillId
+      if (existingData.rebillId === rebillId) {
+        console.log(`⚠️ У пользователя ${userId} уже есть активная подписка с rebillId ${rebillId}`);
+        console.log(`📝 Обновляю существующую подписку ${existingDoc.id}`);
+        
+        // Обновляем существующую подписку
+        const updateData = {
+          lastSuccessfulPayment: new Date().toISOString(),
+          totalPaid: admin.firestore.FieldValue.increment(amount),
+          paymentHistory: admin.firestore.FieldValue.arrayUnion({
+            date: new Date().toISOString(),
+            amount: amount,
+            paymentId: webhookData.PaymentId,
+            orderId: OrderId,
+            status: 'success'
+          }),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          // Обновляем nextPaymentDate на месяц вперед
+          nextPaymentDate: new Date(new Date().setMonth(new Date().getMonth() + 1)).toISOString(),
+          webhookData: webhookData
+        };
+        
+        await existingDoc.ref.update(updateData);
+        
+        // Обновляем планирование
+        const subscriptionId = existingDoc.id;
+        scheduleSubscriptionPayment(userId, {
+          ...existingData,
+          ...updateData,
+          subscriptionId,
+          email: webhookData.Email || existingData.email || 'user@example.com',
+          amount: amount
+        });
+        
+        return { subscriptionId: existingDoc.id, updated: true };
+      }
+      
+      // Если есть активная подписка, но с другим rebillId
+      console.log(`⚠️ У пользователя ${userId} уже есть активная подписка. Отменяю старую и создаю новую.`);
+      
+      // Отменяем старую подписку
+      await cancelUserSubscription(userId, existingDoc.id);
+    }
+    
+    // Создаем новую подписку (если не было активной или была отменена)
     const now = new Date();
     const nextPaymentDate = new Date(now);
     nextPaymentDate.setMonth(nextPaymentDate.getMonth() + 1);
@@ -489,11 +553,7 @@ async function saveUserSubscription(userId, webhookData, rebillId, amount = 390)
     
     const subscriptionId = `sub_${Date.now()}`;
     
-    await db.collection('telegramUsers')
-      .doc(userId.toString())
-      .collection('subscriptions')
-      .doc(subscriptionId)
-      .set(subscriptionData);
+    await subscriptionsRef.doc(subscriptionId).set(subscriptionData);
     
     console.log(`✅ Подписка сохранена для userId=${userId}, subscriptionId=${subscriptionId}`);
     
@@ -542,9 +602,7 @@ async function cancelUserSubscription(userId, subscriptionId) {
     return false;
   }
 }
-// =============================================
-
-// ВАЖНО: Для вебхука от T-Bank парсим raw body
+// ===// ВАЖНО: Для вебхука от T-Bank парсим raw body
 app.use('/api/webhook', bodyParser.raw({ type: '*/*' }));
 
 // Эндпоинт для вебхуков от T-Bank
@@ -554,6 +612,7 @@ app.post('/api/webhook', async (req, res) => {
   let webhookData;
   
   try {
+    // Парсинг данных вебхука
     if (Buffer.isBuffer(req.body) || typeof req.body === 'string') {
       const bodyString = req.body.toString();
       console.log('📨 ВЕБХУК: Raw body:', bodyString);
@@ -571,14 +630,15 @@ app.post('/api/webhook', async (req, res) => {
       webhookData = req.body;
     }
     
+    // Приводим ID к строковому формату
     if (webhookData.PaymentId) webhookData.PaymentId = webhookData.PaymentId.toString();
     if (webhookData.RebillId) webhookData.RebillId = webhookData.RebillId.toString();
     if (webhookData.CardId) webhookData.CardId = webhookData.CardId.toString();
+    if (webhookData.OrderId) webhookData.OrderId = webhookData.OrderId.toString();
     
     console.log('📨 ВЕБХУК: Parsed data:', JSON.stringify(webhookData, null, 2));
     
     const {
-      TerminalKey,
       OrderId,
       Success,
       Status,
@@ -586,8 +646,7 @@ app.post('/api/webhook', async (req, res) => {
       Amount,
       RebillId,
       CardId,
-      Pan,
-      Token
+      Pan
     } = webhookData;
     
     console.log('📨 ВЕБХУК:');
@@ -598,95 +657,185 @@ app.post('/api/webhook', async (req, res) => {
     console.log(`   RebillId: ${RebillId || 'не указан'}`);
     console.log(`   Amount: ${Amount ? Amount / 100 : 0} руб.`);
     
-    // ВАЖНО: Всегда возвращаем успех сразу
+    // ВАЖНО: Всегда возвращаем успех сразу банку
     res.status(200).json({ Success: true, Error: '0' });
     
+    // Начинаем асинхронную обработку
     setTimeout(async () => {
       try {
-        console.log('🔄 ВЕБХУК: Начинаем обработку...');
+        console.log('🔄 ВЕБХУК: Начинаем асинхронную обработку...');
         
-        let orderInfo = null;
+        // ПРОВЕРКА: Не обрабатывать дублирующиеся вебхуки
+        const webhookKey = `wh_${PaymentId}_${Status}_${RebillId || 'norebill'}`;
+        const webhookLogRef = db.collection('webhookLogs').doc(webhookKey);
+        const webhookLog = await webhookLogRef.get();
         
-        if (OrderId) {
-          orderInfo = await findOrderByTbankOrderId(OrderId);
+        if (webhookLog.exists) {
+          console.log(`⚠️ Вебхук уже был обработан ранее: ${webhookKey}`);
+          return;
         }
         
-        if (orderInfo) {
-          console.log(`✅ ВЕБХУК: Найден заказ: userId=${orderInfo.userId}, orderId=${orderInfo.orderId}`);
+        // Логируем обработку вебхука
+        await webhookLogRef.set({
+          processedAt: admin.firestore.FieldValue.serverTimestamp(),
+          status: Status,
+          orderId: OrderId,
+          paymentId: PaymentId,
+          rebillId: RebillId,
+          success: Success,
+          data: webhookData
+        });
+        
+        let orderInfo = null;
+        let rebillIdToProcess = RebillId;
+        
+        // 1. Пытаемся найти заказ по OrderId в маппингах
+        if (OrderId) {
+          orderInfo = await findOrderByTbankOrderId(OrderId);
+          if (orderInfo) {
+            console.log(`✅ ВЕБХУК: Найден заказ в маппингах: userId=${orderInfo.userId}, orderId=${orderInfo.orderId}`);
+          }
+        }
+        
+        // 2. Если не нашли в маппингах, пытаемся найти по PaymentId
+        if (!orderInfo && PaymentId) {
+          console.log(`🔍 Ищу заказ по PaymentId: ${PaymentId}`);
           
-          const rebillId = await updatePaymentFromWebhook(
+          // Ищем во всех пользователях заказ с таким paymentId
+          const usersSnapshot = await db.collection('telegramUsers').limit(10).get();
+          
+          for (const userDoc of usersSnapshot.docs) {
+            const userId = userDoc.id;
+            const ordersRef = db.collection('telegramUsers')
+              .doc(userId)
+              .collection('orders');
+            
+            const querySnapshot = await ordersRef
+              .where('paymentId', '==', PaymentId)
+              .limit(1)
+              .get();
+            
+            if (!querySnapshot.empty) {
+              const orderDoc = querySnapshot.docs[0];
+              orderInfo = {
+                userId: userId,
+                orderId: orderDoc.id,
+                docRef: orderDoc.ref
+              };
+              console.log(`✅ Найден заказ по PaymentId: userId=${userId}, orderId=${orderDoc.id}`);
+              
+              // Сохраняем маппинг для будущих вебхуков
+              if (OrderId) {
+                await saveOrderMapping(OrderId, userId, orderDoc.id);
+              }
+              break;
+            }
+          }
+        }
+        
+        // 3. Обработка найденного заказа
+        if (orderInfo) {
+          // Обновляем платеж данными из вебхука
+          const updatedRebillId = await updatePaymentFromWebhook(
             orderInfo.userId, 
             orderInfo.orderId, 
             webhookData
           );
           
-          if (rebillId) {
-            console.log(`🎉 ВЕБХУК: RebillId сохранен: ${rebillId}`);
+          // Используем rebillId из вебхука или из результата обновления
+          rebillIdToProcess = rebillIdToProcess || updatedRebillId;
+          
+          if (rebillIdToProcess) {
+            console.log(`🎉 ВЕБХУК: RebillId для обработки: ${rebillIdToProcess}`);
             
             // Сохраняем подписку пользователя с планированием
-            await saveUserSubscription(orderInfo.userId, webhookData, rebillId);
+            await saveUserSubscription(orderInfo.userId, webhookData, rebillIdToProcess);
+          } else {
+            console.log('ℹ️ ВЕБХУК: RebillId не получен, возможно это разовый платеж');
+            
+            // Если платеж успешный, но без rebillId - обновляем статус заказа
+            if (Success === true && Status === 'CONFIRMED') {
+              console.log(`✅ Разовый платеж успешен: userId=${orderInfo.userId}, orderId=${orderInfo.orderId}`);
+            }
           }
         } else {
-          console.log('⚠️ ВЕБХУК: Заказ не найден в маппингах');
+          // 4. Заказ не найден - сохраняем для ручной обработки
+          console.log('⚠️ ВЕБХУК: Заказ не найден ни в маппингах, ни по PaymentId');
           
-          try {
-            const docId = PaymentId || `unknown_${Date.now()}`;
+          const docId = `pending_${Date.now()}_${PaymentId || 'no_payment_id'}`;
+          
+          await db.collection('pendingWebhooks')
+            .doc(docId)
+            .set({
+              webhookData: webhookData,
+              receivedAt: admin.firestore.FieldValue.serverTimestamp(),
+              processed: false,
+              orderId: OrderId,
+              paymentId: PaymentId,
+              rebillId: RebillId,
+              status: Status,
+              success: Success,
+              amount: Amount
+            });
+          
+          console.log(`✅ ВЕБХУК: Вебхук сохранен для ручной обработки (ID: ${docId})`);
+          
+          // Если есть rebillId, но не нашли заказ - пытаемся создать подписку по данным вебхука
+          if (RebillId && (Status === 'CONFIRMED' || Status === 'AUTHORIZED')) {
+            console.log('🔍 Пытаюсь обработать подписку по данным вебхука...');
             
-            await db.collection('pendingWebhooks')
-              .doc(docId.toString())
-              .set({
-                webhookData: webhookData,
-                receivedAt: admin.firestore.FieldValue.serverTimestamp(),
-                processed: false,
-                orderId: OrderId,
-                paymentId: PaymentId
-              });
-            
-            console.log(`✅ ВЕБХУК: Вебхук сохранен для ручной обработки (ID: ${docId})`);
-            
-            if (PaymentId) {
-              console.log(`🔍 Пытаемся найти заказ по PaymentId: ${PaymentId} напрямую...`);
-              
-              const userId = '272401691';
-              const ordersRef = db.collection('telegramUsers')
-                .doc(userId)
-                .collection('orders');
-              
-              const querySnapshot = await ordersRef
-                .where('paymentId', '==', PaymentId)
+            // Ищем пользователя по email из вебхука
+            if (webhookData.Email) {
+              const usersSnapshot = await db.collection('telegramUsers')
+                .where('email', '==', webhookData.Email)
                 .limit(1)
                 .get();
               
-              if (!querySnapshot.empty) {
-                const orderDoc = querySnapshot.docs[0];
-                console.log(`✅ Найден заказ напрямую: ${orderDoc.id}`);
+              if (!usersSnapshot.empty) {
+                const userDoc = usersSnapshot.docs[0];
+                const userId = userDoc.id;
+                console.log(`✅ Найден пользователь по email: ${userId}`);
                 
-                const rebillId = await updatePaymentFromWebhook(
-                  userId,
-                  orderDoc.id,
-                  webhookData
-                );
+                await saveUserSubscription(userId, webhookData, RebillId);
                 
-                if (rebillId) {
-                  await saveOrderMapping(OrderId, userId, orderDoc.id);
-                  await saveUserSubscription(userId, webhookData, rebillId);
-                }
-              } else {
-                console.log('⚠️ Заказ не найден даже по прямому поиску');
+                // Помечаем вебхук как обработанный
+                await db.collection('pendingWebhooks')
+                  .doc(docId)
+                  .update({
+                    processed: true,
+                    processedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    processedUserId: userId
+                  });
               }
             }
-          } catch (saveError) {
-            console.error('❌ ВЕБХУК: Ошибка сохранения:', saveError.message);
           }
         }
         
         console.log('✅ ВЕБХУК: Обработка завершена');
       } catch (asyncError) {
         console.error('❌ ВЕБХУК: Ошибка асинхронной обработки:', asyncError.message);
+        console.error('❌ Stack trace:', asyncError.stack);
+        
+        // Сохраняем ошибку для отладки
+        try {
+          await db.collection('webhookErrors')
+            .doc(`${Date.now()}_${webhookData.PaymentId || 'no_id'}`)
+            .set({
+              error: asyncError.message,
+              stack: asyncError.stack,
+              webhookData: webhookData,
+              timestamp: admin.firestore.FieldValue.serverTimestamp()
+            });
+        } catch (logError) {
+          console.error('❌ Не удалось сохранить ошибку:', logError.message);
+        }
       }
-    }, 100);
+    }, 100); // Задержка 100мс перед асинхронной обработкой
+    
   } catch (error) {
-    console.error('❌ ВЕБХУК: Критическая ошибка:', error.message);
+    console.error('❌ ВЕБХУК: Критическая ошибка при парсинге:', error.message);
+    
+    // Всегда возвращаем 200 банку, даже при ошибках
     res.status(200).json({ Success: false, Error: error.message });
   }
 });
