@@ -1051,8 +1051,6 @@ app.post('/api/init-recurrent', async (req, res) => {
       CustomerKey: customerKey,
       Recurrent: 'Y',
       NotificationURL: process.env.NOTIFICATION_URL || 'https://tbank-xp1i.onrender.com/api/webhook',
-      SuccessURL: process.env.SUCCESS_URL || 'https://astro-1-nns5.onrender.com/success',
-      FailURL: process.env.FAIL_URL || 'https://astro-1-nns5.onrender.com/fail',
       Receipt: receipt,
     });
 
