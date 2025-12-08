@@ -1,5 +1,5 @@
 // models/Product.js
-const productsData = require('../src/data/prognosesData.json');
+const productsData = require('../data/prognosesData.json');
 
 class Product {
   static async getAllProducts() {
