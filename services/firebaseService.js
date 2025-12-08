@@ -1,0 +1,294 @@
+const admin = require('firebase-admin');
+const { getDatabase, getAdmin } = require('../config/firebase');
+const schedulerService = require('./schedulerService');
+
+const db = getDatabase();
+const adminInstance = getAdmin();
+
+/**
+ * Ищет заказ по OrderId в специальной коллекции для быстрого поиска
+ */
+async function findOrderByTbankOrderId(tbankOrderId) {
+  try {
+    if (!tbankOrderId) {
+      console.log('⚠️ Пустой OrderId для поиска');
+      return null;
+    }
+    
+    const orderRef = db.collection('orderMappings').doc(tbankOrderId.toString());
+    const orderDoc = await orderRef.get();
+    
+    if (orderDoc.exists) {
+      const data = orderDoc.data();
+      return {
+        userId: data.userId,
+        orderId: data.orderId,
+        docRef: db.collection('telegramUsers')
+          .doc(data.userId.toString())
+          .collection('orders')
+          .doc(data.orderId.toString())
+      };
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('❌ Ошибка поиска заказа:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Сохраняет маппинг OrderId -> userId/orderId для быстрого поиска
+ */
+async function saveOrderMapping(tbankOrderId, userId, orderId) {
+  try {
+    if (!tbankOrderId || !userId || !orderId) {
+      console.error('❌ Ошибка: пустые параметры для маппинга');
+      return;
+    }
+    
+    await db.collection('orderMappings').doc(tbankOrderId.toString()).set({
+      userId: userId.toString(),
+      orderId: orderId.toString(),
+      createdAt: adminInstance.firestore.FieldValue.serverTimestamp()
+    });
+    console.log(`✅ Маппинг сохранен: ${tbankOrderId} -> ${userId}/${orderId}`);
+  } catch (error) {
+    console.error('❌ Ошибка сохранения маппинга:', error);
+  }
+}
+
+/**
+ * Обновляет платеж в Firebase с данными из вебхука
+ */
+async function updatePaymentFromWebhook(userId, orderId, webhookData) {
+  try {
+    const {
+      PaymentId,
+      OrderId,
+      Success,
+      Status,
+      Amount,
+      RebillId,
+      CardId,
+      Pan,
+      Token,
+      PaymentURL
+    } = webhookData;
+    
+    const updateData = {
+      'tinkoff.webhook': webhookData,
+      'tinkoff.Status': Status,
+      'tinkoff.Success': Success,
+      'tinkoff.Amount': Amount,
+      'tinkoff.PaymentId': PaymentId,
+      status: Status,
+      updatedAt: adminInstance.firestore.FieldValue.serverTimestamp(),
+    };
+    
+    if (RebillId) {
+      updateData.rebillId = RebillId;
+      updateData['tinkoff.RebillId'] = RebillId;
+      updateData.finishedAt = adminInstance.firestore.FieldValue.serverTimestamp();
+      console.log(`🔄 RebillId получен: ${RebillId}`);
+    }
+    
+    if (CardId) {
+      updateData['tinkoff.CardId'] = CardId;
+    }
+    
+    const docRef = db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('orders')
+      .doc(orderId);
+    
+    await docRef.update(updateData);
+    
+    console.log(`✅ Платеж обновлен из вебхука: userId=${userId}, orderId=${orderId}`);
+    console.log(`📊 Статус: ${Status}, RebillId: ${RebillId || 'не получен'}`);
+    
+    return RebillId;
+  } catch (error) {
+    console.error('❌ Ошибка обновления из вебхука:', error.message);
+    
+    try {
+      const docRef = db.collection('telegramUsers')
+        .doc(userId.toString())
+        .collection('orders')
+        .doc(orderId);
+      
+      await docRef.set({
+        tinkoff: webhookData,
+        status: webhookData.Status || 'UNKNOWN',
+        amount: webhookData.Amount ? webhookData.Amount / 100 : 0,
+        paymentId: webhookData.PaymentId,
+        orderId: orderId,
+        rebillId: webhookData.RebillId || null,
+        createdAt: adminInstance.firestore.FieldValue.serverTimestamp(),
+        updatedAt: adminInstance.firestore.FieldValue.serverTimestamp(),
+        ...(webhookData.RebillId && { finishedAt: adminInstance.firestore.FieldValue.serverTimestamp() })
+      });
+      
+      console.log(`✅ Создан новый документ из вебхука: ${userId}/${orderId}`);
+      return webhookData.RebillId;
+    } catch (createError) {
+      console.error('❌ Не удалось создать документ:', createError);
+      return null;
+    }
+  }
+}
+
+/**
+ * Сохраняет подписку пользователя и планирует автоматические списания
+ */
+async function saveUserSubscription(userId, webhookData, rebillId, amount = 390) {
+  try {
+    const { CardId, Pan, Amount, OrderId } = webhookData;
+    
+    // ПРОВЕРКА: Есть ли уже активная подписка у пользователя
+    const subscriptionsRef = db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('subscriptions');
+    
+    // Ищем активные подписки с таким же rebillId или статусом active
+    const existingSubscriptions = await subscriptionsRef
+      .where('status', '==', 'active')
+      .limit(1)
+      .get();
+    
+    if (!existingSubscriptions.empty) {
+      const existingDoc = existingSubscriptions.docs[0];
+      const existingData = existingDoc.data();
+      
+      // Если уже есть активная подписка с таким же rebillId
+      if (existingData.rebillId === rebillId) {
+        console.log(`⚠️ У пользователя ${userId} уже есть активная подписка с rebillId ${rebillId}`);
+        console.log(`📝 Обновляю существующую подписку ${existingDoc.id}`);
+        
+        // Обновляем существующую подписку
+        const updateData = {
+          lastSuccessfulPayment: new Date().toISOString(),
+          totalPaid: adminInstance.firestore.FieldValue.increment(amount),
+          paymentHistory: adminInstance.firestore.FieldValue.arrayUnion({
+            date: new Date().toISOString(),
+            amount: amount,
+            paymentId: webhookData.PaymentId,
+            orderId: OrderId,
+            status: 'success'
+          }),
+          updatedAt: adminInstance.firestore.FieldValue.serverTimestamp(),
+          // Обновляем nextPaymentDate на месяц вперед
+          nextPaymentDate: new Date(new Date().setMonth(new Date().getMonth() + 1)).toISOString(),
+          webhookData: webhookData
+        };
+        
+        await existingDoc.ref.update(updateData);
+        
+        // Обновляем планирование
+        const subscriptionId = existingDoc.id;
+        schedulerService.scheduleSubscriptionPayment(userId, {
+          ...existingData,
+          ...updateData,
+          subscriptionId,
+          email: webhookData.Email || existingData.email || 'user@example.com',
+          amount: amount
+        });
+        
+        return { subscriptionId: existingDoc.id, updated: true };
+      }
+      
+      // Если есть активная подписка, но с другим rebillId
+      console.log(`⚠️ У пользователя ${userId} уже есть активная подписка. Отменяю старую и создаю новую.`);
+      
+      // Отменяем старую подписку
+      await cancelUserSubscription(userId, existingDoc.id);
+    }
+    
+    // Создаем новую подписку (если не было активной или была отменена)
+    const now = new Date();
+    const nextPaymentDate = new Date(now);
+    nextPaymentDate.setMonth(nextPaymentDate.getMonth() + 1);
+    
+    const subscriptionData = {
+      rebillId: rebillId,
+      cardLastDigits: Pan ? Pan.slice(-4) : null,
+      cardId: CardId,
+      status: 'active',
+      amount: amount,
+      initialPaymentDate: now.toISOString(),
+      nextPaymentDate: nextPaymentDate.toISOString(),
+      lastSuccessfulPayment: now.toISOString(),
+      totalPaid: amount,
+      paymentHistory: [{
+        date: now.toISOString(),
+        amount: amount,
+        paymentId: webhookData.PaymentId,
+        orderId: OrderId,
+        status: 'success'
+      }],
+      createdAt: adminInstance.firestore.FieldValue.serverTimestamp(),
+      updatedAt: adminInstance.firestore.FieldValue.serverTimestamp(),
+      webhookData: webhookData
+    };
+    
+    const subscriptionId = `sub_${Date.now()}`;
+    
+    await subscriptionsRef.doc(subscriptionId).set(subscriptionData);
+    
+    console.log(`✅ Подписка сохранена для userId=${userId}, subscriptionId=${subscriptionId}`);
+    
+    // Планируем автоматическое списание
+    schedulerService.scheduleSubscriptionPayment(userId, {
+      ...subscriptionData,
+      subscriptionId,
+      email: webhookData.Email || 'user@example.com'
+    });
+    
+    return { subscriptionId, nextPaymentDate: nextPaymentDate.toISOString() };
+  } catch (error) {
+    console.error('❌ Ошибка сохранения подписки:', error);
+    return false;
+  }
+}
+
+/**
+ * Отменяет подписку пользователя
+ */
+async function cancelUserSubscription(userId, subscriptionId) {
+  try {
+    const subscriptionRef = db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('subscriptions')
+      .doc(subscriptionId);
+    
+    await subscriptionRef.update({
+      status: 'cancelled',
+      cancelledAt: new Date().toISOString(),
+      updatedAt: adminInstance.firestore.FieldValue.serverTimestamp()
+    });
+    
+    // Отменяем запланированный платеж
+    const jobId = `sub_${userId}_${subscriptionId}`;
+    if (schedulerService.scheduledJobs.has(jobId)) {
+      schedulerService.scheduledJobs.get(jobId).cancel();
+      schedulerService.scheduledJobs.delete(jobId);
+      console.log(`✅ Отменено запланированное списание для ${jobId}`);
+    }
+    
+    console.log(`✅ Подписка отменена: userId=${userId}, subscriptionId=${subscriptionId}`);
+    return true;
+  } catch (error) {
+    console.error('❌ Ошибка отмены подписки:', error);
+    return false;
+  }
+}
+
+module.exports = {
+  getDatabase,
+  getAdmin,
+  findOrderByTbankOrderId,
+  saveOrderMapping,
+  updatePaymentFromWebhook,
+  saveUserSubscription,
+  cancelUserSubscription
+};
