@@ -104,6 +104,35 @@ async function handleWebhook(req, res, services) {
           orderInfo = await findOrderByTbankOrderId(OrderId);
           if (orderInfo) {
             console.log(`🔎 Найден в маппингах: userId=${orderInfo.userId}, orderId=${orderInfo.orderId}`);
+            
+            // ВАЖНО: Определяем, в какой коллекции находится заказ
+            // Проверяем сначала orders2, потом orders
+            const orders2Ref = db.collection('telegramUsers')
+              .doc(orderInfo.userId)
+              .collection('orders2')
+              .doc(orderInfo.orderId);
+            const orders2Doc = await orders2Ref.get();
+            
+            if (orders2Doc.exists) {
+              orderInfo.collection = 'orders2';
+              orderInfo.docRef = orders2Ref;
+              console.log(`📂 Заказ найден в коллекции orders2`);
+            } else {
+              // Проверяем orders для подписок
+              const ordersRef = db.collection('telegramUsers')
+                .doc(orderInfo.userId)
+                .collection('orders')
+                .doc(orderInfo.orderId);
+              const ordersDoc = await ordersRef.get();
+              
+              if (ordersDoc.exists) {
+                orderInfo.collection = 'orders';
+                orderInfo.docRef = ordersRef;
+                console.log(`📂 Заказ найден в коллекции orders`);
+              } else {
+                console.log(`⚠️ Заказ не найден ни в orders2, ни в orders`);
+              }
+            }
           }
         }
 
@@ -116,7 +145,7 @@ async function handleWebhook(req, res, services) {
           for (const userDoc of usersSnapshot.docs) {
             const userId = userDoc.id;
             
-            // Проверяем в orders2 (для разовых платежей)
+            // Проверяем в orders2 (для разовых платежей) - ПРИОРИТЕТ
             const orders2Ref = db.collection('telegramUsers')
               .doc(userId)
               .collection('orders2');
@@ -139,7 +168,7 @@ async function handleWebhook(req, res, services) {
               break;
             }
 
-            // Проверяем в orders (для обратной совместимости)
+            // Проверяем в orders (для подписок)
             const ordersRef = db.collection('telegramUsers')
               .doc(userId)
               .collection('orders');
@@ -168,19 +197,15 @@ async function handleWebhook(req, res, services) {
         // === 3. ОБРАБОТКА НАЙДЕННОГО ЗАКАЗА ========================
         // ============================================================
         if (orderInfo) {
-          console.log('🔍 Определяю тип заказа...');
+          console.log(`🔍 Обрабатываю заказ из коллекции: ${orderInfo.collection}`);
 
           // Получаем данные заказа
           let orderData = null;
           if (orderInfo.collection === 'orders2') {
-            const orderDoc = await db.collection('telegramUsers')
-              .doc(orderInfo.userId)
-              .collection('orders2')
-              .doc(orderInfo.orderId)
-              .get();
+            const orderDoc = await orderInfo.docRef.get();
             orderData = orderDoc.exists ? orderDoc.data() : null;
-          } else {
-            const orderDoc = await db.collection('orders').doc(orderInfo.orderId).get();
+          } else if (orderInfo.collection === 'orders') {
+            const orderDoc = await orderInfo.docRef.get();
             orderData = orderDoc.exists ? orderDoc.data() : null;
           }
 
@@ -191,54 +216,47 @@ async function handleWebhook(req, res, services) {
             type: orderData?.type
           }, null, 2));
 
-          // === A) Покупка товара (разовый платеж) ===================
-          if ((orderData && orderData.type === 'product_purchase') || 
-              (orderData && orderData.productId) ||
-              (orderInfo.collection === 'orders2')) {
-            console.log(`🛍️ Обработка покупки товара: ${orderInfo.orderId}`);
+          // === A) Разовый платеж (orders2) ===========================
+          if (orderInfo.collection === 'orders2') {
+            console.log(`💰 Обработка разового платежа: ${orderInfo.orderId}`);
 
+            const isSuccess = Success === 'true' || Success === true;
+            
             // Подготавливаем данные для обновления заказа
             const productUpdateData = {
-              status: Success === 'true' || Success === true ? 'PAID' : 'FAILED',
+              status: isSuccess ? 'PAID' : 'FAILED',
+              webhookStatus: Status,
               webhookData: webhookData,
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             };
 
             // Добавляем paidAt только при успешной оплате
-            if (Success === 'true' || Success === true) {
+            if (isSuccess) {
               productUpdateData.paidAt = admin.firestore.FieldValue.serverTimestamp();
               productUpdateData.status = 'PAID';
+              productUpdateData.paymentStatus = 'confirmed';
             }
 
-            // Добавляем данные о товаре, если они есть в заказе
+            // Сохраняем оригинальные данные о товаре
             if (orderData?.productId) productUpdateData.productId = orderData.productId;
             if (orderData?.productType) productUpdateData.productType = orderData.productType;
             if (orderData?.productTitle) productUpdateData.productTitle = orderData.productTitle;
             if (orderData?.description) productUpdateData.description = orderData.description;
 
-            // Обновляем заказ в соответствующей коллекции
-            if (orderInfo.collection === 'orders2') {
-              await db.collection('telegramUsers')
-                .doc(orderInfo.userId)
-                .collection('orders2')
-                .doc(orderInfo.orderId)
-                .set(productUpdateData, { merge: true, ignoreUndefinedProperties: true });
-            } else {
-              await db.collection('orders')
-                .doc(orderInfo.orderId)
-                .set(productUpdateData, { merge: true, ignoreUndefinedProperties: true });
-            }
+            // Обновляем заказ в orders2
+            await orderInfo.docRef.set(productUpdateData, { merge: true, ignoreUndefinedProperties: true });
 
             // Обновляем основной документ пользователя
             const userUpdateData = {
-              'purchase.status': (Success === 'true' || Success === true) ? 'paid' : 'failed',
+              'purchase.status': isSuccess ? 'paid' : 'failed',
               'purchase.updatedAt': admin.firestore.FieldValue.serverTimestamp(),
             };
 
             // При успешной оплате сохраняем дополнительную информацию
-            if (Success === 'true' || Success === true) {
+            if (isSuccess) {
               userUpdateData['purchase.paidAt'] = admin.firestore.FieldValue.serverTimestamp();
               userUpdateData['purchase.paymentId'] = PaymentId;
+              userUpdateData['purchase.webhookStatus'] = Status;
               
               // Сохраняем информацию о товаре
               if (orderData?.productId) {
@@ -254,30 +272,38 @@ async function handleWebhook(req, res, services) {
               .doc(orderInfo.userId)
               .set(userUpdateData, { merge: true, ignoreUndefinedProperties: true });
 
-            console.log(`✅ Данные о покупке товара сохранены: productId=${orderData?.productId || 'N/A'}`);
+            console.log(`✅ Разовый платеж обновлен: productId=${orderData?.productId || 'N/A'}, status=${isSuccess ? 'PAID' : 'FAILED'}`);
 
-            // Обновляем через стандартный сервис (если есть)
+            // Также обновляем через стандартный сервис если это orders
             try {
               if (typeof updatePaymentFromWebhook === 'function') {
+                // Для совместимости также обновляем в orders если нужно
+                if (orderInfo.collection === 'orders2') {
+                  const ordersRef = db.collection('telegramUsers')
+                    .doc(orderInfo.userId)
+                    .collection('orders')
+                    .doc(orderInfo.orderId);
+                  
+                  // Создаем/обновляем и в orders для совместимости
+                  await ordersRef.set({
+                    status: isSuccess ? 'PAID' : 'FAILED',
+                    webhookData: webhookData,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    ...(isSuccess && { paidAt: admin.firestore.FieldValue.serverTimestamp() })
+                  }, { merge: true, ignoreUndefinedProperties: true });
+                }
+                
                 await updatePaymentFromWebhook(orderInfo.userId, orderInfo.orderId, webhookData);
               }
             } catch (e) {
-              console.log('ℹ️ updatePaymentFromWebhook не сработал:', e.message);
-            }
-
-            // Вызываем сервис покупок, если он существует
-            try {
-              const purchaseService = require('./purchaseService');
-              await purchaseService.updatePurchaseStatus(orderInfo, webhookData);
-            } catch (e) {
-              console.log('ℹ️ purchaseService не найден или произошла ошибка:', e.message);
+              console.log('ℹ️ updatePaymentFromWebhook ошибка:', e.message);
             }
           }
 
-          // === B) Рекуррентная подписка =============================
-          else if (orderData && orderData.type === 'recurrent') {
-            console.log(`🔁 Обработка рекуррентной подписки: ${orderInfo.orderId}`);
-
+          // === B) Подписка (orders) =================================
+          else if (orderInfo.collection === 'orders') {
+            console.log(`🔁 Обработка подписки: ${orderInfo.orderId}`);
+            
             if (typeof updatePaymentFromWebhook === 'function') {
               const updatedRebillId = await updatePaymentFromWebhook(
                 orderInfo.userId,
@@ -294,40 +320,43 @@ async function handleWebhook(req, res, services) {
             }
           }
 
-          // === C) Старая логика (совместимость) ======================
+          // === C) Неизвестная коллекция =============================
           else {
-            console.log('ℹ️ Использую старую логику обработки заказа...');
-
-            if (typeof updatePaymentFromWebhook === 'function') {
-              const updatedRebillId = await updatePaymentFromWebhook(
-                orderInfo.userId,
-                orderInfo.orderId,
-                webhookData
-              );
-
-              rebillIdToProcess = rebillIdToProcess || updatedRebillId;
-            }
-
-            if (rebillIdToProcess && typeof saveUserSubscription === 'function') {
-              await saveUserSubscription(orderInfo.userId, webhookData, rebillIdToProcess);
-            }
-
-            // Все равно пытаемся сохранить данные о товаре, если они есть
-            if ((Success === 'true' || Success === true) && orderData?.productId) {
-              console.log(`📦 Сохраняю данные о товаре из старого заказа: productId=${orderData.productId}`);
-
-              const userUpdateData = {
-                'purchase.productId': orderData.productId,
-                'purchase.productType': orderData.productType || 'forecast',
-                'purchase.productTitle': orderData.productTitle || 'Разовый прогноз',
-                'purchase.updatedAt': admin.firestore.FieldValue.serverTimestamp(),
-                'purchase.status': 'paid',
-                'purchase.paidAt': admin.firestore.FieldValue.serverTimestamp()
-              };
-
-              await db.collection('telegramUsers')
+            console.log('⚠️ Неизвестная коллекция заказа, пытаюсь определить автоматически...');
+            
+            // Пробуем обновить в orders2 (приоритет для разовых)
+            try {
+              const orders2Ref = db.collection('telegramUsers')
                 .doc(orderInfo.userId)
-                .set(userUpdateData, { merge: true, ignoreUndefinedProperties: true });
+                .collection('orders2')
+                .doc(orderInfo.orderId);
+              
+              const orders2Doc = await orders2Ref.get();
+              
+              if (orders2Doc.exists) {
+                console.log('🔎 Заказ найден в orders2, обновляю там');
+                
+                const isSuccess = Success === 'true' || Success === true;
+                await orders2Ref.set({
+                  status: isSuccess ? 'PAID' : 'FAILED',
+                  webhookData: webhookData,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  ...(isSuccess && { paidAt: admin.firestore.FieldValue.serverTimestamp() })
+                }, { merge: true, ignoreUndefinedProperties: true });
+              } else {
+                // Пробуем обновить в orders
+                const ordersRef = db.collection('telegramUsers')
+                  .doc(orderInfo.userId)
+                  .collection('orders')
+                  .doc(orderInfo.orderId);
+                
+                await ordersRef.set({
+                  webhookData: webhookData,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                }, { merge: true, ignoreUndefinedProperties: true });
+              }
+            } catch (e) {
+              console.error('❌ Ошибка обновления заказа:', e.message);
             }
           }
         }
