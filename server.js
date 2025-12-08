@@ -30,309 +30,6 @@ const { saveUserSubscription, cancelUserSubscription, findOrderByTbankOrderId, s
 const PurchaseService = require('./services/purchaseService');
 const Product = require('./models/Product');
 
-// ========== ЭНДПОИНТЫ ДЛЯ ПОКУПКИ ТОВАРОВ ==========
-
-/**
- * Получить список товаров
- */
-app.get('/api/products', async (req, res) => {
-  try {
-    const products = await Product.getAllProducts();
-    res.json({
-      success: true,
-      products
-    });
-  } catch (error) {
-    console.error('❌ Ошибка получения товаров:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * Получить информацию о товаре
- */
-app.get('/api/products/:productId', async (req, res) => {
-  try {
-    const { productId } = req.params;
-    const product = await Product.getProductById(productId);
-    
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Товар не найден'
-      });
-    }
-    
-    res.json({
-      success: true,
-      product
-    });
-  } catch (error) {
-    console.error('❌ Ошибка получения товара:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * Инициализировать покупку товара
- */
-app.post('/api/products/purchase', async (req, res) => {
-  try {
-    const { userId, productId, email, phone, description } = req.body;
-    
-    if (!userId || !productId || !email) {
-      return res.status(400).json({
-        success: false,
-        error: 'Необходимо указать userId, productId и email'
-      });
-    }
-    
-    const result = await PurchaseService.initProductPurchase({
-      userId,
-      productId,
-      email,
-      phone,
-      description
-    });
-    
-    res.json(result);
-    
-  } catch (error) {
-    console.error('❌ Ошибка инициализации покупки:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * Получить покупки пользователя
- */
-app.get('/api/users/:userId/purchases', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const purchases = await PurchaseService.getUserPurchases(userId);
-    
-    res.json({
-      success: true,
-      purchases
-    });
-  } catch (error) {
-    console.error('❌ Ошибка получения покупок:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * Получить купленные товары пользователя
- */
-app.get('/api/users/:userId/purchased-products', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const products = await PurchaseService.getUserPurchasedProducts(userId);
-    
-    res.json({
-      success: true,
-      products
-    });
-  } catch (error) {
-    console.error('❌ Ошибка получения купленных товаров:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * Проверить, купил ли пользователь товар
- */
-app.get('/api/users/:userId/has-purchased/:productId', async (req, res) => {
-  try {
-    const { userId, productId } = req.params;
-    const hasPurchased = await PurchaseService.hasUserPurchasedProduct(userId, productId);
-    
-    res.json({
-      success: true,
-      hasPurchased,
-      productId
-    });
-  } catch (error) {
-    console.error('❌ Ошибка проверки покупки:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * Увеличить счетчик скачиваний
- */
-app.post('/api/users/:userId/download/:productId', async (req, res) => {
-  try {
-    const { userId, productId } = req.params;
-    
-    const newCount = await PurchaseService.incrementDownloadCount(userId, productId);
-    
-    res.json({
-      success: true,
-      downloadCount: newCount,
-      productId
-    });
-  } catch (error) {
-    console.error('❌ Ошибка увеличения счетчика скачиваний:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-/**
- * Получить статистику пользователя
- */
-app.get('/api/users/:userId/stats', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const db = req.db;
-    
-    const userRef = db.collection('telegramUsers').doc(userId);
-    const userDoc = await userRef.get();
-    
-    if (!userDoc.exists) {
-      return res.status(404).json({
-        success: false,
-        error: 'Пользователь не найден'
-      });
-    }
-    
-    const userData = userDoc.data();
-    
-    // Получаем количество покупок
-    const purchasesRef = db.collection('telegramUsers')
-      .doc(userId)
-      .collection('purchases');
-    const purchasesSnapshot = await purchasesRef.get();
-    
-    // Получаем купленные товары
-    const purchasedProductsRef = db.collection('telegramUsers')
-      .doc(userId)
-      .collection('purchasedProducts');
-    const productsSnapshot = await purchasedProductsRef.get();
-    
-    const stats = {
-      totalSpent: userData.totalSpent || 0,
-      totalPurchases: purchasesSnapshot.size,
-      totalProducts: productsSnapshot.size,
-      lastPurchaseDate: userData.lastPurchaseDate || null,
-      createdAt: userData.createdAt || null
-    };
-    
-    res.json({
-      success: true,
-      stats
-    });
-  } catch (error) {
-    console.error('❌ Ошибка получения статистики:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
-// Обновляем существующий эндпоинт для проверки статуса платежа
-app.post('/api/check-payment', async (req, res) => {
-  try {
-    const { paymentId, orderId, userId } = req.body;
-    const tbank = req.tbank;
-    const db = req.db;
-    
-    if (!paymentId) {
-      return res.status(400).json({
-        success: false,
-        error: 'Необходимо указать paymentId'
-      });
-    }
-
-    const status = await tbank.getPaymentState({
-      PaymentId: paymentId
-    });
-
-    if (userId && orderId) {
-      try {
-        // Проверяем тип заказа
-        const orderDoc = await db.collection('orders').doc(orderId).get();
-        const orderData = orderDoc.exists ? orderDoc.data() : null;
-        
-        if (orderData && orderData.type === 'product_purchase') {
-          // Обновляем заказ товара
-          await db.collection('orders').doc(orderId).update({
-            'tinkoff.statusCheck': status,
-            'tinkoff.Status': status.Status,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-          
-          // Обновляем в профиле пользователя
-          await db.collection('telegramUsers')
-            .doc(userId.toString())
-            .collection('purchases')
-            .doc(orderId)
-            .update({
-              status: status.Status,
-              success: status.Success,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              ...(status.Success && { delivered: true, purchasedAt: new Date().toISOString() })
-            });
-        } else {
-          // Старая логика для обратной совместимости
-          await db.collection('telegramUsers')
-            .doc(userId.toString())
-            .collection('orders')
-            .doc(orderId)
-            .update({
-              'tinkoff.statusCheck': status,
-              'tinkoff.Status': status.Status,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp()
-            });
-        }
-        
-        console.log(`✅ Статус обновлен в Firebase: paymentId=${paymentId}`);
-      } catch (firebaseError) {
-        console.error('❌ Ошибка обновления Firebase:', firebaseError);
-      }
-    }
-
-    res.json({
-      success: true,
-      paymentId: paymentId,
-      status: status.Status,
-      rebillId: status.RebillId,
-      cardId: status.CardId,
-      amount: status.Amount ? status.Amount / 100 : 0,
-      data: status
-    });
-
-  } catch (error) {
-    console.error('❌ Ошибка проверки статуса:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
-
 // ========== ЭНДПОИНТЫ ==========
 
 // Middleware для передачи зависимостей
@@ -590,7 +287,7 @@ app.get('/api/admin/subscriptions', async (req, res) => {
 // ========== СУЩЕСТВУЮЩИЕ ЭНДПОИНТЫ ==========
 app.post('/api/init-once', async (req, res) => {
   try {
-    const { amount, email, phone, description, userId, orderId } = req.body;
+    const { amount, email, phone, description, userId, orderId, productId, productType, productTitle } = req.body;
     const tbank = req.tbank;
     const db = req.db;
     const admin = req.admin;
@@ -605,6 +302,12 @@ app.post('/api/init-once', async (req, res) => {
 
     console.log('🚀 Инициализация разового платежа');
     console.log('userId:', userId, 'orderId:', orderId);
+    console.log('📦 Product data:', { productId, productType, productTitle });
+
+    // Создаем описание с информацией о товаре
+    const productDescription = productTitle 
+      ? `Разовый платеж: ${productTitle}`
+      : (description || 'Разовая покупка');
 
     const receipt = {
       Email: email,
@@ -612,7 +315,7 @@ app.post('/api/init-once', async (req, res) => {
       Taxation: 'osn',
       Items: [
         {
-          Name: description || 'Разовая покупка',
+          Name: productDescription,
           Price: amount * 100,
           Quantity: 1,
           Amount: amount * 100,
@@ -628,33 +331,52 @@ app.post('/api/init-once', async (req, res) => {
     const payment = await tbank.initPayment({
       Amount: amount * 100,
       OrderId: tbankOrderId,
-      Description: description || 'Разовый платеж',
+      Description: productDescription,
       NotificationURL: process.env.NOTIFICATION_URL || 'https://tbank-xp1i.onrender.com/api/webhook',
       Receipt: receipt
     });
 
     console.log('💳 Разовый платеж создан. PaymentId:', payment.PaymentId);
 
+    // Подготовка данных для сохранения
+    const orderData = {
+      tinkoff: {
+        ...payment,
+        Amount: amount * 100,
+        OrderId: tbankOrderId,
+        PaymentId: payment.PaymentId
+      },
+      status: 'INITIATED',
+      amount: amount,
+      paymentId: payment.PaymentId,
+      orderId: orderId,
+      productId: productId || null,
+      productType: productType || 'forecast',
+      productTitle: productTitle || productDescription,
+      description: productDescription,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+
+    // Сохраняем данные о заказе
     await db.collection('telegramUsers')
       .doc(userId.toString())
       .collection('orders2')
       .doc(orderId.toString())
-      .set({
-        tinkoff: {
-          ...payment,
-          Amount: amount * 100,
-          OrderId: tbankOrderId,
-          PaymentId: payment.PaymentId
-        },
-        status: 'INITIATED',
-        amount: amount,
-        paymentId: payment.PaymentId,
-        orderId: orderId,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-      });
+      .set(orderData);
 
     console.log(`✅ Разовый платеж сохранён в Firebase: userId=${userId}, orderId=${orderId}`);
+    console.log(`📦 Product info saved: productId=${productId}, type=${productType}`);
+
+    // Также обновляем основной документ пользователя
+    await db.collection('telegramUsers')
+      .doc(userId.toString())
+      .update({
+        'purchase.productId': productId || null,
+        'purchase.productTitle': productTitle || productDescription,
+        'purchase.productType': productType || 'forecast',
+        'updatedAt': admin.firestore.FieldValue.serverTimestamp()
+      });
 
     await saveOrderMapping(tbankOrderId, userId, orderId);
 
@@ -664,6 +386,8 @@ app.post('/api/init-once', async (req, res) => {
       paymentUrl: payment.PaymentURL,
       orderId: tbankOrderId,
       firebaseId: orderId,
+      productId: productId,
+      productType: productType,
       message: 'Перейдите по URL для оплаты. После оплаты вебхук обновит статус платежа.'
     });
 
@@ -676,6 +400,7 @@ app.post('/api/init-once', async (req, res) => {
     });
   }
 });
+
 
 app.post('/api/init-recurrent', async (req, res) => {
   try {
