@@ -35,11 +35,14 @@ async function handleWebhook(req, res, services) {
       webhookData = req.body;
     }
     
-    // Приведение типов
-    if (webhookData.PaymentId) webhookData.PaymentId = webhookData.PaymentId.toString();
-    if (webhookData.RebillId) webhookData.RebillId = webhookData.RebillId.toString();
-    if (webhookData.CardId) webhookData.CardId = webhookData.CardId.toString();
-    if (webhookData.OrderId) webhookData.OrderId = webhookData.OrderId.toString();
+    // Приведение типов и обработка undefined
+    const sanitizedWebhookData = {};
+    for (const [key, value] of Object.entries(webhookData)) {
+      if (value !== undefined && value !== null) {
+        sanitizedWebhookData[key] = value.toString();
+      }
+    }
+    webhookData = sanitizedWebhookData;
     
     console.log('📨 PARSED WEBHOOK:', JSON.stringify(webhookData, null, 2));
 
@@ -76,15 +79,22 @@ async function handleWebhook(req, res, services) {
           return;
         }
 
-        await webhookLogRef.set({
+        // Подготавливаем данные для лога без undefined значений
+        const webhookLogData = {
           processedAt: admin.firestore.FieldValue.serverTimestamp(),
           status: Status,
           orderId: OrderId,
           paymentId: PaymentId,
-          rebillId: RebillId,
-          success: Success,
+          success: Success === 'true' || Success === true,
           data: webhookData
-        });
+        };
+
+        // Добавляем rebillId только если он существует
+        if (RebillId) {
+          webhookLogData.rebillId = RebillId;
+        }
+
+        await webhookLogRef.set(webhookLogData, { ignoreUndefinedProperties: true });
 
         let orderInfo = null;
         let rebillIdToProcess = RebillId;
@@ -160,7 +170,7 @@ async function handleWebhook(req, res, services) {
         if (orderInfo) {
           console.log('🔍 Определяю тип заказа...');
 
-          // === ДОБАВЛЕНО: Получаем данные заказа для сохранения информации о товаре ===
+          // Получаем данные заказа
           let orderData = null;
           if (orderInfo.collection === 'orders2') {
             const orderDoc = await db.collection('telegramUsers')
@@ -181,25 +191,30 @@ async function handleWebhook(req, res, services) {
             type: orderData?.type
           }, null, 2));
 
-          // === A) Покупка товара =====================================
+          // === A) Покупка товара (разовый платеж) ===================
           if ((orderData && orderData.type === 'product_purchase') || 
-              (orderData && orderData.productId)) {
+              (orderData && orderData.productId) ||
+              (orderInfo.collection === 'orders2')) {
             console.log(`🛍️ Обработка покупки товара: ${orderInfo.orderId}`);
 
-            await updatePaymentFromWebhook(orderInfo.userId, orderInfo.orderId, webhookData);
-
-            // ДОБАВЛЕНО: Сохраняем данные о товаре
+            // Подготавливаем данные для обновления заказа
             const productUpdateData = {
-              status: Success ? 'PAID' : 'FAILED',
+              status: Success === 'true' || Success === true ? 'PAID' : 'FAILED',
               webhookData: webhookData,
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              ...(Success && { paidAt: admin.firestore.FieldValue.serverTimestamp() })
             };
 
+            // Добавляем paidAt только при успешной оплате
+            if (Success === 'true' || Success === true) {
+              productUpdateData.paidAt = admin.firestore.FieldValue.serverTimestamp();
+              productUpdateData.status = 'PAID';
+            }
+
             // Добавляем данные о товаре, если они есть в заказе
-            if (orderData.productId) productUpdateData.productId = orderData.productId;
-            if (orderData.productType) productUpdateData.productType = orderData.productType;
-            if (orderData.productTitle) productUpdateData.productTitle = orderData.productTitle;
+            if (orderData?.productId) productUpdateData.productId = orderData.productId;
+            if (orderData?.productType) productUpdateData.productType = orderData.productType;
+            if (orderData?.productTitle) productUpdateData.productTitle = orderData.productTitle;
+            if (orderData?.description) productUpdateData.description = orderData.description;
 
             // Обновляем заказ в соответствующей коллекции
             if (orderInfo.collection === 'orders2') {
@@ -207,36 +222,48 @@ async function handleWebhook(req, res, services) {
                 .doc(orderInfo.userId)
                 .collection('orders2')
                 .doc(orderInfo.orderId)
-                .set(productUpdateData, { merge: true });
+                .set(productUpdateData, { merge: true, ignoreUndefinedProperties: true });
             } else {
               await db.collection('orders')
                 .doc(orderInfo.orderId)
-                .set(productUpdateData, { merge: true });
+                .set(productUpdateData, { merge: true, ignoreUndefinedProperties: true });
             }
 
-            // ДОБАВЛЕНО: Обновляем основной документ пользователя с информацией о товаре
+            // Обновляем основной документ пользователя
             const userUpdateData = {
-              'purchase.status': Success ? 'paid' : 'failed',
+              'purchase.status': (Success === 'true' || Success === true) ? 'paid' : 'failed',
               'purchase.updatedAt': admin.firestore.FieldValue.serverTimestamp(),
-              ...(Success && {
-                'purchase.paidAt': admin.firestore.FieldValue.serverTimestamp(),
-                'purchase.paymentId': PaymentId
-              })
             };
 
-            // Сохраняем информацию о товаре в основном документе
-            if (Success && orderData.productId) {
-              userUpdateData['purchase.productId'] = orderData.productId;
-              userUpdateData['purchase.productType'] = orderData.productType || 'forecast';
-              userUpdateData['purchase.productTitle'] = orderData.productTitle || 'Разовый прогноз';
-              userUpdateData['purchase.description'] = orderData.description || `Покупка: ${orderData.productTitle || 'товар'}`;
+            // При успешной оплате сохраняем дополнительную информацию
+            if (Success === 'true' || Success === true) {
+              userUpdateData['purchase.paidAt'] = admin.firestore.FieldValue.serverTimestamp();
+              userUpdateData['purchase.paymentId'] = PaymentId;
+              
+              // Сохраняем информацию о товаре
+              if (orderData?.productId) {
+                userUpdateData['purchase.productId'] = orderData.productId;
+                userUpdateData['purchase.productType'] = orderData.productType || 'forecast';
+                userUpdateData['purchase.productTitle'] = orderData.productTitle || 'Разовый прогноз';
+                userUpdateData['purchase.description'] = orderData.description || `Покупка: ${orderData.productTitle || 'товар'}`;
+                userUpdateData['purchase.amount'] = Amount ? parseInt(Amount) / 100 : orderData?.amount || 0;
+              }
             }
 
             await db.collection('telegramUsers')
               .doc(orderInfo.userId)
-              .set(userUpdateData, { merge: true });
+              .set(userUpdateData, { merge: true, ignoreUndefinedProperties: true });
 
-            console.log(`✅ Данные о покупке товара сохранены: productId=${orderData.productId}`);
+            console.log(`✅ Данные о покупке товара сохранены: productId=${orderData?.productId || 'N/A'}`);
+
+            // Обновляем через стандартный сервис (если есть)
+            try {
+              if (typeof updatePaymentFromWebhook === 'function') {
+                await updatePaymentFromWebhook(orderInfo.userId, orderInfo.orderId, webhookData);
+              }
+            } catch (e) {
+              console.log('ℹ️ updatePaymentFromWebhook не сработал:', e.message);
+            }
 
             // Вызываем сервис покупок, если он существует
             try {
@@ -251,13 +278,15 @@ async function handleWebhook(req, res, services) {
           else if (orderData && orderData.type === 'recurrent') {
             console.log(`🔁 Обработка рекуррентной подписки: ${orderInfo.orderId}`);
 
-            const updatedRebillId = await updatePaymentFromWebhook(
-              orderInfo.userId,
-              orderInfo.orderId,
-              webhookData
-            );
+            if (typeof updatePaymentFromWebhook === 'function') {
+              const updatedRebillId = await updatePaymentFromWebhook(
+                orderInfo.userId,
+                orderInfo.orderId,
+                webhookData
+              );
 
-            rebillIdToProcess = rebillIdToProcess || updatedRebillId;
+              rebillIdToProcess = rebillIdToProcess || updatedRebillId;
+            }
 
             if (rebillIdToProcess) {
               await saveUserSubscription(orderInfo.userId, webhookData, rebillIdToProcess);
@@ -269,30 +298,36 @@ async function handleWebhook(req, res, services) {
           else {
             console.log('ℹ️ Использую старую логику обработки заказа...');
 
-            const updatedRebillId = await updatePaymentFromWebhook(
-              orderInfo.userId,
-              orderInfo.orderId,
-              webhookData
-            );
+            if (typeof updatePaymentFromWebhook === 'function') {
+              const updatedRebillId = await updatePaymentFromWebhook(
+                orderInfo.userId,
+                orderInfo.orderId,
+                webhookData
+              );
 
-            rebillIdToProcess = rebillIdToProcess || updatedRebillId;
+              rebillIdToProcess = rebillIdToProcess || updatedRebillId;
+            }
 
-            if (rebillIdToProcess) {
+            if (rebillIdToProcess && typeof saveUserSubscription === 'function') {
               await saveUserSubscription(orderInfo.userId, webhookData, rebillIdToProcess);
             }
 
-            // ДОБАВЛЕНО: Все равно пытаемся сохранить данные о товаре, если они есть
-            if (Success && orderData && orderData.productId) {
+            // Все равно пытаемся сохранить данные о товаре, если они есть
+            if ((Success === 'true' || Success === true) && orderData?.productId) {
               console.log(`📦 Сохраняю данные о товаре из старого заказа: productId=${orderData.productId}`);
+
+              const userUpdateData = {
+                'purchase.productId': orderData.productId,
+                'purchase.productType': orderData.productType || 'forecast',
+                'purchase.productTitle': orderData.productTitle || 'Разовый прогноз',
+                'purchase.updatedAt': admin.firestore.FieldValue.serverTimestamp(),
+                'purchase.status': 'paid',
+                'purchase.paidAt': admin.firestore.FieldValue.serverTimestamp()
+              };
 
               await db.collection('telegramUsers')
                 .doc(orderInfo.userId)
-                .set({
-                  'purchase.productId': orderData.productId,
-                  'purchase.productType': orderData.productType || 'forecast',
-                  'purchase.productTitle': orderData.productTitle || 'Разовый прогноз',
-                  'purchase.updatedAt': admin.firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
+                .set(userUpdateData, { merge: true, ignoreUndefinedProperties: true });
             }
           }
         }
@@ -304,17 +339,24 @@ async function handleWebhook(req, res, services) {
           console.log('⚠️ Заказ не найден! Сохраняю в pendingWebhooks...');
 
           const docId = `pending_${Date.now()}_${PaymentId || 'no_pid'}`;
-          await db.collection('pendingWebhooks').doc(docId).set({
+          
+          const pendingData = {
             webhookData,
             receivedAt: admin.firestore.FieldValue.serverTimestamp(),
             processed: false,
             orderId: OrderId,
             paymentId: PaymentId,
-            rebillId: RebillId,
             status: Status,
-            success: Success,
+            success: Success === 'true' || Success === true,
             amount: Amount
-          });
+          };
+
+          // Добавляем rebillId только если он существует
+          if (RebillId) {
+            pendingData.rebillId = RebillId;
+          }
+
+          await db.collection('pendingWebhooks').doc(docId).set(pendingData, { ignoreUndefinedProperties: true });
 
           // === Попытка найти пользователя по email для подписки ===
           if (RebillId && (Status === 'CONFIRMED' || Status === 'AUTHORIZED') && webhookData.Email) {
@@ -328,7 +370,9 @@ async function handleWebhook(req, res, services) {
             if (!usersByEmail.empty) {
               const userId = usersByEmail.docs[0].id;
 
-              await saveUserSubscription(userId, webhookData, RebillId);
+              if (typeof saveUserSubscription === 'function') {
+                await saveUserSubscription(userId, webhookData, RebillId);
+              }
 
               await db.collection('pendingWebhooks').doc(docId).update({
                 processed: true,
@@ -346,14 +390,16 @@ async function handleWebhook(req, res, services) {
       } catch (e) {
         console.error('❌ Ошибка обработки вебхука:', e);
 
+        const errorData = {
+          error: e.message,
+          stack: e.stack,
+          webhookData,
+          timestamp: admin.firestore.FieldValue.serverTimestamp()
+        };
+
         await db.collection('webhookErrors')
-          .doc(`${Date.now()}_${webhookData.PaymentId || 'noid'}`)
-          .set({
-            error: e.message,
-            stack: e.stack,
-            webhookData,
-            timestamp: admin.firestore.FieldValue.serverTimestamp()
-          });
+          .doc(`${Date.now()}_${webhookData?.PaymentId || 'noid'}`)
+          .set(errorData, { ignoreUndefinedProperties: true });
       }
     }, 100);
 
