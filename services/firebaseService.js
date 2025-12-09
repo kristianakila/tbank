@@ -141,9 +141,32 @@ async function updatePaymentFromWebhook(userId, orderId, webhookData) {
 /**
  * Сохраняет подписку пользователя и планирует автоматические списания
  */
+/**
+ * Сохраняет подписку пользователя и планирует автоматические списания
+ */
 async function saveUserSubscription(userId, webhookData, rebillId, amount = 390) {
   try {
     const { CardId, Pan, Amount, OrderId } = webhookData;
+    
+    // Получаем цену повторного списания из Firebase
+    let recurringPaymentPrice = amount; // Используем переданную сумму по умолчанию
+    
+    try {
+      const subscriptionProductRef = db.collection('subscriptionProducts')
+        .doc('subscription_1765286344111');
+      const subscriptionProductDoc = await subscriptionProductRef.get();
+      
+      if (subscriptionProductDoc.exists) {
+        const productData = subscriptionProductDoc.data();
+        if (productData.recurringPaymentPrice) {
+          recurringPaymentPrice = productData.recurringPaymentPrice;
+          console.log(`✅ Получена цена повторного списания: ${recurringPaymentPrice}`);
+        }
+      }
+    } catch (priceError) {
+      console.error('❌ Ошибка получения цены повторного списания:', priceError.message);
+      console.log(`⚠️ Используется сумма по умолчанию: ${recurringPaymentPrice}`);
+    }
     
     // ПРОВЕРКА: Есть ли уже активная подписка у пользователя
     const subscriptionsRef = db.collection('telegramUsers')
@@ -165,7 +188,7 @@ async function saveUserSubscription(userId, webhookData, rebillId, amount = 390)
         console.log(`⚠️ У пользователя ${userId} уже есть активная подписка с rebillId ${rebillId}`);
         console.log(`📝 Обновляю существующую подписку ${existingDoc.id}`);
         
-        // Обновляем существующую подписку
+        // Обновляем существующую подписку с ценой повторного списания
         const updateData = {
           lastSuccessfulPayment: new Date().toISOString(),
           totalPaid: adminInstance.firestore.FieldValue.increment(amount),
@@ -179,19 +202,21 @@ async function saveUserSubscription(userId, webhookData, rebillId, amount = 390)
           updatedAt: adminInstance.firestore.FieldValue.serverTimestamp(),
           // Обновляем nextPaymentDate на месяц вперед
           nextPaymentDate: new Date(new Date().setMonth(new Date().getMonth() + 1)).toISOString(),
-          webhookData: webhookData
+          webhookData: webhookData,
+          // Обновляем сумму следующего платежа
+          amount: recurringPaymentPrice
         };
         
         await existingDoc.ref.update(updateData);
         
-        // Обновляем планирование
+        // Обновляем планирование с новой ценой
         const subscriptionId = existingDoc.id;
         schedulerService.scheduleSubscriptionPayment(userId, {
           ...existingData,
           ...updateData,
           subscriptionId,
           email: webhookData.Email || existingData.email || 'user@example.com',
-          amount: amount
+          amount: recurringPaymentPrice // Используем цену повторного списания
         });
         
         return { subscriptionId: existingDoc.id, updated: true };
@@ -214,11 +239,11 @@ async function saveUserSubscription(userId, webhookData, rebillId, amount = 390)
       cardLastDigits: Pan ? Pan.slice(-4) : null,
       cardId: CardId,
       status: 'active',
-      amount: amount,
+      amount: recurringPaymentPrice, // Используем цену повторного списания
       initialPaymentDate: now.toISOString(),
       nextPaymentDate: nextPaymentDate.toISOString(),
       lastSuccessfulPayment: now.toISOString(),
-      totalPaid: amount,
+      totalPaid: amount, // Первоначальный платеж может отличаться от повторного
       paymentHistory: [{
         date: now.toISOString(),
         amount: amount,
@@ -236,15 +261,21 @@ async function saveUserSubscription(userId, webhookData, rebillId, amount = 390)
     await subscriptionsRef.doc(subscriptionId).set(subscriptionData);
     
     console.log(`✅ Подписка сохранена для userId=${userId}, subscriptionId=${subscriptionId}`);
+    console.log(`💰 Цена повторного списания: ${recurringPaymentPrice}`);
     
-    // Планируем автоматическое списание
+    // Планируем автоматическое списание с ценой повторного списания
     schedulerService.scheduleSubscriptionPayment(userId, {
       ...subscriptionData,
       subscriptionId,
-      email: webhookData.Email || 'user@example.com'
+      email: webhookData.Email || 'user@example.com',
+      amount: recurringPaymentPrice
     });
     
-    return { subscriptionId, nextPaymentDate: nextPaymentDate.toISOString() };
+    return { 
+      subscriptionId, 
+      nextPaymentDate: nextPaymentDate.toISOString(),
+      recurringPaymentPrice: recurringPaymentPrice 
+    };
   } catch (error) {
     console.error('❌ Ошибка сохранения подписки:', error);
     return false;
