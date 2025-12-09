@@ -33,6 +33,95 @@ async function getRecurringPaymentPrice() {
 }
 
 /**
+ * Проверка на наличие других активных подписок у пользователя
+ */
+async function checkOtherActiveSubscriptions(userId, currentSubscriptionId) {
+  try {
+    const subscriptionsRef = db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('subscriptions');
+    
+    // Найти все активные подписки кроме текущей
+    const activeSubscriptions = await subscriptionsRef
+      .where('status', '==', 'active')
+      .get();
+    
+    const otherActiveSubscriptions = [];
+    
+    activeSubscriptions.forEach(doc => {
+      if (doc.id !== currentSubscriptionId) {
+        otherActiveSubscriptions.push({
+          id: doc.id,
+          data: doc.data()
+        });
+      }
+    });
+    
+    if (otherActiveSubscriptions.length > 0) {
+      console.log(`⚠️ У пользователя ${userId} найдены другие активные подписки:`, 
+        otherActiveSubscriptions.map(sub => sub.id));
+      return otherActiveSubscriptions;
+    }
+    
+    return [];
+  } catch (error) {
+    console.error('❌ Ошибка проверки активных подписок:', error.message);
+    return [];
+  }
+}
+
+/**
+ * Отмена всех других активных подписок пользователя
+ */
+async function cancelOtherActiveSubscriptions(userId, keepSubscriptionId) {
+  try {
+    const otherSubscriptions = await checkOtherActiveSubscriptions(userId, keepSubscriptionId);
+    
+    if (otherSubscriptions.length === 0) {
+      return { cancelled: 0, errors: 0 };
+    }
+    
+    let cancelled = 0;
+    let errors = 0;
+    
+    for (const subscription of otherSubscriptions) {
+      try {
+        const subscriptionRef = db.collection('telegramUsers')
+          .doc(userId.toString())
+          .collection('subscriptions')
+          .doc(subscription.id);
+        
+        await subscriptionRef.update({
+          status: 'cancelled_by_system',
+          cancellationReason: 'multiple_active_subscriptions',
+          cancelledAt: new Date().toISOString(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        
+        // Отменяем запланированное списание
+        const jobId = `sub_${userId}_${subscription.id}`;
+        if (scheduledJobs.has(jobId)) {
+          scheduledJobs.get(jobId).cancel();
+          scheduledJobs.delete(jobId);
+          console.log(`🗑️ Отменено запланированное списание для ${jobId}`);
+        }
+        
+        cancelled++;
+        console.log(`✅ Отменена дублирующая подписка ${subscription.id} для пользователя ${userId}`);
+      } catch (error) {
+        console.error(`❌ Ошибка отмены подписки ${subscription.id}:`, error.message);
+        errors++;
+      }
+    }
+    
+    return { cancelled, errors };
+  } catch (error) {
+    console.error('❌ Ошибка при отмене других подписок:', error.message);
+    return { cancelled: 0, errors: 1 };
+  }
+}
+
+/**
  * Расписание для автоматического списания подписки
  */
 async function scheduleSubscriptionPayment(userId, subscriptionData) {
@@ -41,6 +130,15 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
   if (!nextPaymentDate || !rebillId) {
     console.error('❌ Недостаточно данных для планирования');
     return null;
+  }
+
+  // Проверяем и отменяем другие активные подписки
+  const cancellationResult = await cancelOtherActiveSubscriptions(userId, subscriptionId);
+  if (cancellationResult.errors > 0) {
+    console.log(`⚠️ Были ошибки при отмене других подписок для ${userId}`);
+  }
+  if (cancellationResult.cancelled > 0) {
+    console.log(`✅ Отменено ${cancellationResult.cancelled} других активных подписок для ${userId}`);
   }
 
   // Получаем текущую цену повторного списания
@@ -76,6 +174,35 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
     console.log(`⏰ Выполняю автоматическое списание для пользователя ${userId}`);
     
     try {
+      // Проверяем, что текущая подписка все еще активна
+      const subscriptionRef = db.collection('telegramUsers')
+        .doc(userId.toString())
+        .collection('subscriptions')
+        .doc(subscriptionId);
+      
+      const subscriptionDoc = await subscriptionRef.get();
+      
+      if (!subscriptionDoc.exists) {
+        console.error(`❌ Подписка ${subscriptionId} не найдена, отменяем списание`);
+        scheduledJobs.delete(jobId);
+        return;
+      }
+      
+      const subscriptionData = subscriptionDoc.data();
+      if (subscriptionData.status !== 'active') {
+        console.error(`❌ Подписка ${subscriptionId} не активна (статус: ${subscriptionData.status}), отменяем списание`);
+        scheduledJobs.delete(jobId);
+        return;
+      }
+      
+      // Проверяем, что у пользователя нет других активных подписок
+      const otherActiveSubscriptions = await checkOtherActiveSubscriptions(userId, subscriptionId);
+      if (otherActiveSubscriptions.length > 0) {
+        console.error(`❌ У пользователя ${userId} найдены другие активные подписки, отменяем текущее списание`);
+        scheduledJobs.delete(jobId);
+        return;
+      }
+
       // Получаем актуальную цену на момент списания
       const currentRecurringPrice = await getRecurringPaymentPrice();
       const paymentAmount = currentRecurringPrice !== null ? currentRecurringPrice : amount;
@@ -95,16 +222,12 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
       nextDate.setMonth(nextDate.getMonth() + 1);
       
       // Обновляем подписку с актуальной ценой
-      await db.collection('telegramUsers')
-        .doc(userId.toString())
-        .collection('subscriptions')
-        .doc(subscriptionId)
-        .update({
-          nextPaymentDate: nextDate.toISOString(),
-          lastScheduledPayment: new Date().toISOString(),
-          amount: paymentAmount, // Обновляем сумму следующего платежа
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+      await subscriptionRef.update({
+        nextPaymentDate: nextDate.toISOString(),
+        lastScheduledPayment: new Date().toISOString(),
+        amount: paymentAmount, // Обновляем сумму следующего платежа
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
       
       // Планируем следующий платеж
       await scheduleSubscriptionPayment(userId, {
@@ -147,6 +270,23 @@ async function executeRecurrentPayment(params) {
   const tbank = tbankService.getTbankInstance();
   
   try {
+    // Проверяем, что подписка все еще активна перед списанием
+    const subscriptionRef = db.collection('telegramUsers')
+      .doc(userId.toString())
+      .collection('subscriptions')
+      .doc(subscriptionId);
+    
+    const subscriptionDoc = await subscriptionRef.get();
+    
+    if (!subscriptionDoc.exists) {
+      throw new Error(`Подписка ${subscriptionId} не найдена`);
+    }
+    
+    const subscriptionData = subscriptionDoc.data();
+    if (subscriptionData.status !== 'active') {
+      throw new Error(`Подписка ${subscriptionId} не активна (статус: ${subscriptionData.status})`);
+    }
+    
     const orderId = `recurrent-auto-${Date.now()}-${userId}`;
     
     // Создаем чек
@@ -213,23 +353,19 @@ async function executeRecurrentPayment(params) {
 
     // Обновляем статус подписки
     if (chargeResult.Success) {
-      await db.collection('telegramUsers')
-        .doc(userId.toString())
-        .collection('subscriptions')
-        .doc(subscriptionId)
-        .update({
-          lastSuccessfulPayment: new Date().toISOString(),
-          totalPaid: admin.firestore.FieldValue.increment(amount),
-          paymentHistory: admin.firestore.FieldValue.arrayUnion({
-            date: new Date().toISOString(),
-            amount: amount,
-            paymentId: newPayment.PaymentId,
-            orderId: orderId,
-            status: 'success'
-          }),
-          status: 'active',
-          updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+      await subscriptionRef.update({
+        lastSuccessfulPayment: new Date().toISOString(),
+        totalPaid: admin.firestore.FieldValue.increment(amount),
+        paymentHistory: admin.firestore.FieldValue.arrayUnion({
+          date: new Date().toISOString(),
+          amount: amount,
+          paymentId: newPayment.PaymentId,
+          orderId: orderId,
+          status: 'success'
+        }),
+        status: 'active',
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
       
       console.log(`✅ Платеж успешно выполнен и сохранен для ${userId}`);
       return { success: true, paymentId: newPayment.PaymentId };
@@ -254,29 +390,74 @@ async function restoreScheduledJobs() {
     let restoredCount = 0;
     const now = new Date();
     
+    // Собираем всех пользователей и их подписки
+    const userSubscriptions = new Map(); // userId -> Array of subscriptions
+    
+    // Сначала группируем подписки по пользователям
     for (const doc of subscriptionsSnapshot.docs) {
-      try {
-        const subscriptionData = doc.data();
-        const userId = doc.ref.parent.parent.id;
-        const subscriptionId = doc.id;
+      const subscriptionData = doc.data();
+      const userId = doc.ref.parent.parent.id;
+      const subscriptionId = doc.id;
+      
+      if (subscriptionData.status === 'active' && 
+          subscriptionData.nextPaymentDate &&
+          new Date(subscriptionData.nextPaymentDate) > now) {
         
-        // Проверяем условия локально
-        if (subscriptionData.status === 'active' && 
-            subscriptionData.nextPaymentDate &&
-            new Date(subscriptionData.nextPaymentDate) > now) {
-          
-          const jobId = await scheduleSubscriptionPayment(userId, {
-            ...subscriptionData,
-            subscriptionId
+        if (!userSubscriptions.has(userId)) {
+          userSubscriptions.set(userId, []);
+        }
+        
+        userSubscriptions.get(userId).push({
+          id: subscriptionId,
+          data: subscriptionData,
+          docRef: doc.ref
+        });
+      }
+    }
+    
+    // Для каждого пользователя оставляем только одну самую новую подписку
+    for (const [userId, subscriptions] of userSubscriptions.entries()) {
+      if (subscriptions.length === 0) continue;
+      
+      // Сортируем по дате создания (самая новая первая)
+      subscriptions.sort((a, b) => {
+        const dateA = a.data.createdAt ? new Date(a.data.createdAt) : new Date(0);
+        const dateB = b.data.createdAt ? new Date(b.data.createdAt) : new Date(0);
+        return dateB.getTime() - dateA.getTime();
+      });
+      
+      // Оставляем только самую новую подписку
+      const keepSubscription = subscriptions[0];
+      const otherSubscriptions = subscriptions.slice(1);
+      
+      // Отменяем старые подписки
+      for (const oldSubscription of otherSubscriptions) {
+        try {
+          await oldSubscription.docRef.update({
+            status: 'cancelled_by_system',
+            cancellationReason: 'multiple_subscriptions_on_restart',
+            cancelledAt: new Date().toISOString(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
           });
-          
-          if (jobId) {
-            restoredCount++;
-            console.log(`✅ Восстановлено расписание для пользователя ${userId}, подписка ${subscriptionId}`);
-          }
+          console.log(`✅ Отменена старая подписка ${oldSubscription.id} при восстановлении для ${userId}`);
+        } catch (error) {
+          console.error(`❌ Ошибка отмены старой подписки ${oldSubscription.id}:`, error.message);
+        }
+      }
+      
+      // Восстанавливаем только одну подписку
+      try {
+        const jobId = await scheduleSubscriptionPayment(userId, {
+          ...keepSubscription.data,
+          subscriptionId: keepSubscription.id
+        });
+        
+        if (jobId) {
+          restoredCount++;
+          console.log(`✅ Восстановлено расписание для пользователя ${userId}, подписка ${keepSubscription.id}`);
         }
       } catch (error) {
-        console.error(`❌ Ошибка восстановления подписки ${doc.id}:`, error);
+        console.error(`❌ Ошибка восстановления подписки ${keepSubscription.id}:`, error);
       }
     }
     
@@ -292,5 +473,7 @@ module.exports = {
   scheduleSubscriptionPayment,
   executeRecurrentPayment,
   restoreScheduledJobs,
-  getRecurringPaymentPrice // Экспортируем для использования в других модулях
+  getRecurringPaymentPrice,
+  checkOtherActiveSubscriptions,
+  cancelOtherActiveSubscriptions
 };
