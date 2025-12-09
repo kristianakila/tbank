@@ -7,14 +7,51 @@ const scheduledJobs = new Map();
 const db = getDatabase();
 
 /**
+ * Получить цену повторного списания из Firebase
+ */
+async function getRecurringPaymentPrice() {
+  try {
+    const subscriptionProductRef = db.collection('subscriptionProducts')
+      .doc('subscription_1765286344111');
+    const subscriptionProductDoc = await subscriptionProductRef.get();
+    
+    if (subscriptionProductDoc.exists) {
+      const productData = subscriptionProductDoc.data();
+      if (productData.recurringPaymentPrice) {
+        const price = productData.recurringPaymentPrice;
+        console.log(`✅ Получена цена повторного списания из Firebase: ${price}`);
+        return price;
+      }
+    }
+    
+    console.log('⚠️ Цена повторного списания не найдена, используется значение по умолчанию');
+    return null;
+  } catch (error) {
+    console.error('❌ Ошибка получения цены повторного списания:', error.message);
+    return null;
+  }
+}
+
+/**
  * Расписание для автоматического списания подписки
  */
-function scheduleSubscriptionPayment(userId, subscriptionData) {
-  const { nextPaymentDate, amount, rebillId, email, subscriptionId } = subscriptionData;
+async function scheduleSubscriptionPayment(userId, subscriptionData) {
+  const { nextPaymentDate, rebillId, email, subscriptionId } = subscriptionData;
   
   if (!nextPaymentDate || !rebillId) {
     console.error('❌ Недостаточно данных для планирования');
     return null;
+  }
+
+  // Получаем текущую цену повторного списания
+  let amount = subscriptionData.amount || 390; // Значение по умолчанию
+  const recurringPrice = await getRecurringPaymentPrice();
+  
+  if (recurringPrice !== null) {
+    amount = recurringPrice;
+    console.log(`💰 Установлена цена списания: ${amount} (из Firebase)`);
+  } else {
+    console.log(`💰 Используется сохраненная цена: ${amount}`);
   }
 
   const jobId = `sub_${userId}_${subscriptionId}`;
@@ -39,11 +76,15 @@ function scheduleSubscriptionPayment(userId, subscriptionData) {
     console.log(`⏰ Выполняю автоматическое списание для пользователя ${userId}`);
     
     try {
+      // Получаем актуальную цену на момент списания
+      const currentRecurringPrice = await getRecurringPaymentPrice();
+      const paymentAmount = currentRecurringPrice !== null ? currentRecurringPrice : amount;
+      
       // Выполняем платеж
       await executeRecurrentPayment({
         userId,
         rebillId,
-        amount,
+        amount: paymentAmount,
         email,
         description: 'Автоматическое списание по подписке',
         subscriptionId
@@ -53,7 +94,7 @@ function scheduleSubscriptionPayment(userId, subscriptionData) {
       const nextDate = new Date(paymentDate);
       nextDate.setMonth(nextDate.getMonth() + 1);
       
-      // Обновляем подписку
+      // Обновляем подписку с актуальной ценой
       await db.collection('telegramUsers')
         .doc(userId.toString())
         .collection('subscriptions')
@@ -61,16 +102,18 @@ function scheduleSubscriptionPayment(userId, subscriptionData) {
         .update({
           nextPaymentDate: nextDate.toISOString(),
           lastScheduledPayment: new Date().toISOString(),
+          amount: paymentAmount, // Обновляем сумму следующего платежа
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
       
       // Планируем следующий платеж
-      scheduleSubscriptionPayment(userId, {
+      await scheduleSubscriptionPayment(userId, {
         ...subscriptionData,
-        nextPaymentDate: nextDate.toISOString()
+        nextPaymentDate: nextDate.toISOString(),
+        amount: paymentAmount
       });
       
-      console.log(`✅ Следующий платеж запланирован на ${nextDate.toISOString()}`);
+      console.log(`✅ Следующий платеж запланирован на ${nextDate.toISOString()} с суммой ${paymentAmount}`);
     } catch (error) {
       console.error(`❌ Ошибка автоматического списания для ${userId}:`, error);
       
@@ -91,7 +134,7 @@ function scheduleSubscriptionPayment(userId, subscriptionData) {
   });
 
   scheduledJobs.set(jobId, job);
-  console.log(`✅ Платеж запланирован для ${userId} на ${paymentDate.toISOString()}`);
+  console.log(`✅ Платеж запланирован для ${userId} на ${paymentDate.toISOString()} с суммой ${amount}`);
   
   return jobId;
 }
@@ -206,10 +249,6 @@ async function restoreScheduledJobs() {
   console.log('🔍 Восстанавливаю запланированные платежи...');
   
   try {
-    // ВАЖНО: Firebase требует индекс для запросов collectionGroup с несколькими условиями
-    // Временно используем упрощенный запрос
-    
-    // Альтернативный подход 1: Получаем ВСЕ подписки и фильтруем локально
     const subscriptionsSnapshot = await db.collectionGroup('subscriptions').get();
     
     let restoredCount = 0;
@@ -226,7 +265,7 @@ async function restoreScheduledJobs() {
             subscriptionData.nextPaymentDate &&
             new Date(subscriptionData.nextPaymentDate) > now) {
           
-          const jobId = scheduleSubscriptionPayment(userId, {
+          const jobId = await scheduleSubscriptionPayment(userId, {
             ...subscriptionData,
             subscriptionId
           });
@@ -245,39 +284,6 @@ async function restoreScheduledJobs() {
     
   } catch (error) {
     console.error('❌ Ошибка при восстановлении расписания:', error.message);
-    
-    // Альтернативный подход 2: Временная обходная версия для отладки
-    console.log('🔄 Использую альтернативный метод восстановления...');
-    
-    try {
-      // Получаем подписки для конкретного тестового пользователя (если есть)
-      const testUserId = '272401691';
-      const subscriptionsRef = db.collection('telegramUsers')
-        .doc(testUserId)
-        .collection('subscriptions');
-      
-      const snapshot = await subscriptionsRef.get();
-      
-      let altRestoredCount = 0;
-      
-      snapshot.forEach(doc => {
-        const subscriptionData = doc.data();
-        if (subscriptionData.status === 'active' && subscriptionData.nextPaymentDate) {
-          const jobId = scheduleSubscriptionPayment(testUserId, {
-            ...subscriptionData,
-            subscriptionId: doc.id
-          });
-          
-          if (jobId) {
-            altRestoredCount++;
-          }
-        }
-      });
-      
-      console.log(`✅ Альтернативно восстановлено ${altRestoredCount} платежей для тестового пользователя`);
-    } catch (altError) {
-      console.error('❌ Ошибка альтернативного восстановления:', altError.message);
-    }
   }
 }
 
@@ -285,5 +291,6 @@ module.exports = {
   scheduledJobs,
   scheduleSubscriptionPayment,
   executeRecurrentPayment,
-  restoreScheduledJobs
+  restoreScheduledJobs,
+  getRecurringPaymentPrice // Экспортируем для использования в других модулях
 };
