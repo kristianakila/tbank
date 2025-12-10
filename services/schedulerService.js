@@ -125,7 +125,7 @@ async function cancelOtherActiveSubscriptions(userId, keepSubscriptionId) {
  * Расписание для автоматического списания подписки
  */
 async function scheduleSubscriptionPayment(userId, subscriptionData) {
-  const { nextPaymentDate, rebillId, email, subscriptionId } = subscriptionData;
+  const { nextPaymentDate, rebillId, email, subscriptionId, amount } = subscriptionData;
   
   if (!nextPaymentDate || !rebillId) {
     console.error('❌ Недостаточно данных для планирования');
@@ -141,16 +141,11 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
     console.log(`✅ Отменено ${cancellationResult.cancelled} других активных подписок для ${userId}`);
   }
 
-  // Получаем текущую цену повторного списания
-  let amount = subscriptionData.amount || 390; // Значение по умолчанию
-  const recurringPrice = await getRecurringPaymentPrice();
+  // ВАЖНО: Используем фиксированную сумму из данных подписки, а не получаем текущую цену из Firebase
+  // Это гарантирует, что все списания для этой подписки будут по одной и той же цене
+  const fixedAmount = amount || 390; // Используем сумму, зафиксированную при создании подписки
   
-  if (recurringPrice !== null) {
-    amount = recurringPrice;
-    console.log(`💰 Установлена цена списания: ${amount} (из Firebase)`);
-  } else {
-    console.log(`💰 Используется сохраненная цена: ${amount}`);
-  }
+  console.log(`💰 Используется фиксированная цена списания: ${fixedAmount} (зафиксирована при создании подписки)`);
 
   const jobId = `sub_${userId}_${subscriptionId}`;
   
@@ -203,9 +198,11 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
         return;
       }
 
-      // Получаем актуальную цену на момент списания
-      const currentRecurringPrice = await getRecurringPaymentPrice();
-      const paymentAmount = currentRecurringPrice !== null ? currentRecurringPrice : amount;
+      // ВАЖНО: Используем фиксированную сумму из данных подписки, а не получаем текущую цену
+      // Это гарантирует консистентность цены для всей подписки
+      const paymentAmount = subscriptionData.amount || fixedAmount;
+      
+      console.log(`💰 Используется фиксированная сумма списания: ${paymentAmount} (из данных подписки)`);
       
       // Выполняем платеж
       await executeRecurrentPayment({
@@ -221,22 +218,22 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
       const nextDate = new Date(paymentDate);
       nextDate.setMonth(nextDate.getMonth() + 1);
       
-      // Обновляем подписку с актуальной ценой
+      // Обновляем подписку (цена остается той же)
       await subscriptionRef.update({
         nextPaymentDate: nextDate.toISOString(),
         lastScheduledPayment: new Date().toISOString(),
-        amount: paymentAmount, // Обновляем сумму следующего платежа
+        amount: paymentAmount, // Сохраняем ту же фиксированную сумму
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
-      // Планируем следующий платеж
+      // Планируем следующий платеж с той же фиксированной суммой
       await scheduleSubscriptionPayment(userId, {
         ...subscriptionData,
         nextPaymentDate: nextDate.toISOString(),
-        amount: paymentAmount
+        amount: paymentAmount // Передаем ту же фиксированную сумму
       });
       
-      console.log(`✅ Следующий платеж запланирован на ${nextDate.toISOString()} с суммой ${paymentAmount}`);
+      console.log(`✅ Следующий платеж запланирован на ${nextDate.toISOString()} с фиксированной суммой ${paymentAmount}`);
     } catch (error) {
       console.error(`❌ Ошибка автоматического списания для ${userId}:`, error);
       
@@ -257,7 +254,7 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
   });
 
   scheduledJobs.set(jobId, job);
-  console.log(`✅ Платеж запланирован для ${userId} на ${paymentDate.toISOString()} с суммой ${amount}`);
+  console.log(`✅ Платеж запланирован для ${userId} на ${paymentDate.toISOString()} с фиксированной суммой ${fixedAmount}`);
   
   return jobId;
 }
