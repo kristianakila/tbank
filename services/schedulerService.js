@@ -67,29 +67,34 @@ async function checkOtherActiveSubscriptions(userId, currentSubscriptionId) {
       .doc(userId.toString())
       .collection('subscriptions');
     
-    // Найти все активные подписки кроме текущей
-    const activeSubscriptions = await subscriptionsRef
-      .where('status', '==', 'active')
-      .get();
+    // Получаем ВСЕ подписки пользователя для точной проверки
+    const allSubscriptions = await subscriptionsRef.get();
     
     const otherActiveSubscriptions = [];
     
-    activeSubscriptions.forEach(doc => {
-      if (doc.id !== currentSubscriptionId) {
+    allSubscriptions.forEach(doc => {
+      const subscriptionData = doc.data();
+      
+      // Пропускаем текущую подписку
+      if (doc.id === currentSubscriptionId) {
+        return;
+      }
+      
+      // Проверяем, активна ли подписка (не отменена и не истекла)
+      if (subscriptionData.status === 'active') {
         otherActiveSubscriptions.push({
           id: doc.id,
-          data: doc.data()
+          data: subscriptionData
         });
       }
     });
     
     if (otherActiveSubscriptions.length > 0) {
       console.log(`⚠️ У пользователя ${userId} найдены другие активные подписки:`, 
-        otherActiveSubscriptions.map(sub => sub.id));
-      return otherActiveSubscriptions;
+        otherActiveSubscriptions.map(sub => `${sub.id} (rebillId: ${sub.data.rebillId || 'нет'})`));
     }
     
-    return [];
+    return otherActiveSubscriptions;
   } catch (error) {
     console.error('❌ Ошибка проверки активных подписок:', error.message);
     return [];
@@ -101,6 +106,20 @@ async function checkOtherActiveSubscriptions(userId, currentSubscriptionId) {
  */
 async function cancelOtherActiveSubscriptions(userId, keepSubscriptionId) {
   try {
+    // Получаем данные основной подписки для проверки rebillId
+    let keepSubscriptionData = null;
+    if (keepSubscriptionId) {
+      const keepSubscriptionRef = db.collection('telegramUsers')
+        .doc(userId.toString())
+        .collection('subscriptions')
+        .doc(keepSubscriptionId);
+      const keepSubscriptionDoc = await keepSubscriptionRef.get();
+      
+      if (keepSubscriptionDoc.exists) {
+        keepSubscriptionData = keepSubscriptionDoc.data();
+      }
+    }
+    
     const otherSubscriptions = await checkOtherActiveSubscriptions(userId, keepSubscriptionId);
     
     if (otherSubscriptions.length === 0) {
@@ -117,9 +136,29 @@ async function cancelOtherActiveSubscriptions(userId, keepSubscriptionId) {
           .collection('subscriptions')
           .doc(subscription.id);
         
+        const subscriptionData = subscription.data;
+        
+        // ВАЖНОЕ ИСПРАВЛЕНИЕ: Не отменяем подписку, если у нее тот же rebillId
+        // Это предотвращает отмену самой себя при рекуррентном списании
+        if (keepSubscriptionData && subscriptionData.rebillId && 
+            subscriptionData.rebillId === keepSubscriptionData.rebillId) {
+          console.log(`⚠️ Пропускаем отмену подписки ${subscription.id} - тот же rebillId (${subscriptionData.rebillId})`);
+          continue;
+        }
+        
+        // Не отменяем уже отмененные подписки
+        if (subscriptionData.status === 'cancelled' || 
+            subscriptionData.status === 'cancelled_by_system' ||
+            subscriptionData.status === 'expired') {
+          console.log(`⚠️ Подписка ${subscription.id} уже отменена (статус: ${subscriptionData.status})`);
+          continue;
+        }
+        
+        // Отменяем подписку
         await subscriptionRef.update({
           status: 'cancelled_by_system',
           cancellationReason: 'multiple_active_subscriptions',
+          cancellationDetails: `Отменена в пользу подписки ${keepSubscriptionId}`,
           cancelledAt: new Date().toISOString(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
@@ -158,13 +197,18 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
     return null;
   }
 
-  // Проверяем и отменяем другие активные подписки
-  const cancellationResult = await cancelOtherActiveSubscriptions(userId, subscriptionId);
-  if (cancellationResult.errors > 0) {
-    console.log(`⚠️ Были ошибки при отмене других подписок для ${userId}`);
-  }
-  if (cancellationResult.cancelled > 0) {
-    console.log(`✅ Отменено ${cancellationResult.cancelled} других активных подписок для ${userId}`);
+  // ВАЖНОЕ ИЗМЕНЕНИЕ: Проверяем и отменяем другие активные подписки ТОЛЬКО при создании новой подписки
+  // При автоматическом списании НЕ отменяем другие подписки
+  // Это предотвращает отмену самой себя
+  const isNewSubscription = subscriptionData.isNewSubscription || false;
+  if (isNewSubscription) {
+    const cancellationResult = await cancelOtherActiveSubscriptions(userId, subscriptionId);
+    if (cancellationResult.errors > 0) {
+      console.log(`⚠️ Были ошибки при отмене других подписок для ${userId}`);
+    }
+    if (cancellationResult.cancelled > 0) {
+      console.log(`✅ Отменено ${cancellationResult.cancelled} других активных подписок для ${userId}`);
+    }
   }
 
   // Получаем актуальную цену повторного списания
@@ -207,17 +251,43 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
         return;
       }
       
-      const subscriptionData = subscriptionDoc.data();
-      if (subscriptionData.status !== 'active') {
-        console.error(`❌ Подписка ${subscriptionId} не активна (статус: ${subscriptionData.status}), отменяем списание`);
+      const currentSubscriptionData = subscriptionDoc.data();
+      if (currentSubscriptionData.status !== 'active') {
+        console.error(`❌ Подписка ${subscriptionId} не активна (статус: ${currentSubscriptionData.status}), отменяем списание`);
         scheduledJobs.delete(jobId);
         return;
       }
       
-      // Проверяем, что у пользователя нет других активных подписок
-      const otherActiveSubscriptions = await checkOtherActiveSubscriptions(userId, subscriptionId);
-      if (otherActiveSubscriptions.length > 0) {
-        console.error(`❌ У пользователя ${userId} найдены другие активные подписки, отменяем текущее списание`);
+      // ВАЖНОЕ ИСПРАВЛЕНИЕ: При автоматическом списании НЕ проверяем другие активные подписки
+      // Вместо этого проверяем, что это самая новая подписка с данным rebillId
+      
+      // Получаем все подписки с таким же rebillId
+      const subscriptionsWithSameRebillId = await db.collection('telegramUsers')
+        .doc(userId.toString())
+        .collection('subscriptions')
+        .where('rebillId', '==', rebillId)
+        .get();
+      
+      let newestSubscription = null;
+      let newestDate = new Date(0);
+      
+      subscriptionsWithSameRebillId.forEach(doc => {
+        const subData = doc.data();
+        if (subData.status === 'active') {
+          const lastPayment = subData.lastSuccessfulPayment ? new Date(subData.lastSuccessfulPayment) : 
+                            subData.initialPaymentDate ? new Date(subData.initialPaymentDate) : 
+                            subData.createdAt ? new Date(subData.createdAt) : new Date(0);
+          
+          if (lastPayment > newestDate) {
+            newestDate = lastPayment;
+            newestSubscription = doc;
+          }
+        }
+      });
+      
+      // Если текущая подписка не самая новая с этим rebillId - отменяем списание
+      if (newestSubscription && newestSubscription.id !== subscriptionId) {
+        console.log(`⚠️ Подписка ${subscriptionId} не самая новая с rebillId ${rebillId} (новая: ${newestSubscription.id}), отменяем списание`);
         scheduledJobs.delete(jobId);
         return;
       }
@@ -244,15 +314,20 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
       await subscriptionRef.update({
         nextPaymentDate: nextDate.toISOString(),
         lastScheduledPayment: new Date().toISOString(),
+        lastSuccessfulPayment: new Date().toISOString(),
         amount: paymentAmount, // Обновляем сумму следующего платежа
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
-      // Планируем следующий платеж
+      // Планируем следующий платеж (НЕ как новую подписку)
       await scheduleSubscriptionPayment(userId, {
-        ...subscriptionData,
+        ...currentSubscriptionData,
         nextPaymentDate: nextDate.toISOString(),
-        amount: paymentAmount
+        amount: paymentAmount,
+        subscriptionId,
+        rebillId,
+        email,
+        isNewSubscription: false // Важно: это не новая подписка
       });
       
       console.log(`✅ Следующий платеж запланирован на ${nextDate.toISOString()} с суммой ${paymentAmount}`);
@@ -310,7 +385,7 @@ async function executeRecurrentPayment(params) {
     
     // Создаем чек
     const receipt = {
-      Email: email,
+      Email: email || 'user@example.com',
       Phone: '+79001234567',
       Taxation: 'osn',
       Items: [
@@ -380,7 +455,8 @@ async function executeRecurrentPayment(params) {
           amount: amount,
           paymentId: newPayment.PaymentId,
           orderId: orderId,
-          status: 'success'
+          status: 'success',
+          type: 'recurring_payment'
         }),
         status: 'active',
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -420,7 +496,8 @@ async function restoreScheduledJobs() {
       
       if (subscriptionData.status === 'active' && 
           subscriptionData.nextPaymentDate &&
-          new Date(subscriptionData.nextPaymentDate) > now) {
+          new Date(subscriptionData.nextPaymentDate) > now &&
+          subscriptionData.rebillId) {
         
         if (!userSubscriptions.has(userId)) {
           userSubscriptions.set(userId, []);
@@ -434,49 +511,71 @@ async function restoreScheduledJobs() {
       }
     }
     
-    // Для каждого пользователя оставляем только одну самую новую подписку
+    // Для каждого пользователя оставляем только одну самую новую подписку с каждым rebillId
     for (const [userId, subscriptions] of userSubscriptions.entries()) {
       if (subscriptions.length === 0) continue;
       
-      // Сортируем по дате создания (самая новая первая)
-      subscriptions.sort((a, b) => {
-        const dateA = a.data.createdAt ? new Date(a.data.createdAt) : new Date(0);
-        const dateB = b.data.createdAt ? new Date(b.data.createdAt) : new Date(0);
-        return dateB.getTime() - dateA.getTime();
+      // Группируем подписки по rebillId
+      const subscriptionsByRebillId = new Map();
+      
+      subscriptions.forEach(sub => {
+        const rebillId = sub.data.rebillId;
+        if (!rebillId) return;
+        
+        if (!subscriptionsByRebillId.has(rebillId)) {
+          subscriptionsByRebillId.set(rebillId, []);
+        }
+        
+        subscriptionsByRebillId.get(rebillId).push(sub);
       });
       
-      // Оставляем только самую новую подписку
-      const keepSubscription = subscriptions[0];
-      const otherSubscriptions = subscriptions.slice(1);
-      
-      // Отменяем старые подписки
-      for (const oldSubscription of otherSubscriptions) {
-        try {
-          await oldSubscription.docRef.update({
-            status: 'cancelled_by_system',
-            cancellationReason: 'multiple_subscriptions_on_restart',
-            cancelledAt: new Date().toISOString(),
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-          console.log(`✅ Отменена старая подписка ${oldSubscription.id} при восстановлении для ${userId}`);
-        } catch (error) {
-          console.error(`❌ Ошибка отмены старой подписки ${oldSubscription.id}:`, error.message);
-        }
-      }
-      
-      // Восстанавливаем только одну подписку
-      try {
-        const jobId = await scheduleSubscriptionPayment(userId, {
-          ...keepSubscription.data,
-          subscriptionId: keepSubscription.id
+      // Для каждого rebillId оставляем самую новую подписку
+      for (const [rebillId, subs] of subscriptionsByRebillId.entries()) {
+        // Сортируем по дате последнего платежа (самая новая первая)
+        subs.sort((a, b) => {
+          const dateA = a.data.lastSuccessfulPayment ? new Date(a.data.lastSuccessfulPayment) : 
+                       a.data.initialPaymentDate ? new Date(a.data.initialPaymentDate) : 
+                       a.data.createdAt ? new Date(a.data.createdAt) : new Date(0);
+          const dateB = b.data.lastSuccessfulPayment ? new Date(b.data.lastSuccessfulPayment) : 
+                       b.data.initialPaymentDate ? new Date(b.data.initialPaymentDate) : 
+                       b.data.createdAt ? new Date(b.data.createdAt) : new Date(0);
+          return dateB.getTime() - dateA.getTime();
         });
         
-        if (jobId) {
-          restoredCount++;
-          console.log(`✅ Восстановлено расписание для пользователя ${userId}, подписка ${keepSubscription.id}`);
+        // Оставляем только самую новую подписку для этого rebillId
+        const keepSubscription = subs[0];
+        const otherSubscriptions = subs.slice(1);
+        
+        // Отменяем старые подписки с тем же rebillId
+        for (const oldSubscription of otherSubscriptions) {
+          try {
+            await oldSubscription.docRef.update({
+              status: 'cancelled_by_system',
+              cancellationReason: 'multiple_subscriptions_same_rebillId',
+              cancelledAt: new Date().toISOString(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            console.log(`✅ Отменена старая подписка ${oldSubscription.id} с rebillId ${rebillId} при восстановлении для ${userId}`);
+          } catch (error) {
+            console.error(`❌ Ошибка отмены старой подписки ${oldSubscription.id}:`, error.message);
+          }
         }
-      } catch (error) {
-        console.error(`❌ Ошибка восстановления подписки ${keepSubscription.id}:`, error);
+        
+        // Восстанавливаем только одну подписку для каждого rebillId
+        try {
+          const jobId = await scheduleSubscriptionPayment(userId, {
+            ...keepSubscription.data,
+            subscriptionId: keepSubscription.id,
+            isNewSubscription: false // При восстановлении это не новая подписка
+          });
+          
+          if (jobId) {
+            restoredCount++;
+            console.log(`✅ Восстановлено расписание для пользователя ${userId}, подписка ${keepSubscription.id} с rebillId ${rebillId}`);
+          }
+        } catch (error) {
+          console.error(`❌ Ошибка восстановления подписки ${keepSubscription.id}:`, error);
+        }
       }
     }
     
