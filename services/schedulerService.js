@@ -7,6 +7,32 @@ const scheduledJobs = new Map();
 const db = getDatabase();
 
 /**
+ * Получить цену первого платежа из Firebase
+ */
+async function getFirstPaymentPrice() {
+  try {
+    const subscriptionProductRef = db.collection('subscriptionProducts')
+      .doc('subscription_1765286344111');
+    const subscriptionProductDoc = await subscriptionProductRef.get();
+    
+    if (subscriptionProductDoc.exists) {
+      const productData = subscriptionProductDoc.data();
+      if (productData.firstPaymentPrice !== undefined) {
+        const price = productData.firstPaymentPrice;
+        console.log(`✅ Получена цена первого платежа из Firebase: ${price}`);
+        return price;
+      }
+    }
+    
+    console.log('⚠️ Цена первого платежа не найдена, используется значение по умолчанию');
+    return 390; // Значение по умолчанию
+  } catch (error) {
+    console.error('❌ Ошибка получения цены первого платежа:', error.message);
+    return 390; // Значение по умолчанию при ошибке
+  }
+}
+
+/**
  * Получить цену повторного списания из Firebase
  */
 async function getRecurringPaymentPrice() {
@@ -17,7 +43,7 @@ async function getRecurringPaymentPrice() {
     
     if (subscriptionProductDoc.exists) {
       const productData = subscriptionProductDoc.data();
-      if (productData.recurringPaymentPrice) {
+      if (productData.recurringPaymentPrice !== undefined) {
         const price = productData.recurringPaymentPrice;
         console.log(`✅ Получена цена повторного списания из Firebase: ${price}`);
         return price;
@@ -25,10 +51,10 @@ async function getRecurringPaymentPrice() {
     }
     
     console.log('⚠️ Цена повторного списания не найдена, используется значение по умолчанию');
-    return null;
+    return 390; // Значение по умолчанию
   } catch (error) {
     console.error('❌ Ошибка получения цены повторного списания:', error.message);
-    return null;
+    return 390; // Значение по умолчанию при ошибке
   }
 }
 
@@ -125,7 +151,7 @@ async function cancelOtherActiveSubscriptions(userId, keepSubscriptionId) {
  * Расписание для автоматического списания подписки
  */
 async function scheduleSubscriptionPayment(userId, subscriptionData) {
-  const { nextPaymentDate, rebillId, email, subscriptionId, amount } = subscriptionData;
+  const { nextPaymentDate, rebillId, email, subscriptionId } = subscriptionData;
   
   if (!nextPaymentDate || !rebillId) {
     console.error('❌ Недостаточно данных для планирования');
@@ -141,11 +167,9 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
     console.log(`✅ Отменено ${cancellationResult.cancelled} других активных подписок для ${userId}`);
   }
 
-  // ВАЖНО: Используем фиксированную сумму из данных подписки, а не получаем текущую цену из Firebase
-  // Это гарантирует, что все списания для этой подписки будут по одной и той же цене
-  const fixedAmount = amount || 390; // Используем сумму, зафиксированную при создании подписки
-  
-  console.log(`💰 Используется фиксированная цена списания: ${fixedAmount} (зафиксирована при создании подписки)`);
+  // Получаем актуальную цену повторного списания
+  const amount = await getRecurringPaymentPrice();
+  console.log(`💰 Установлена цена списания: ${amount} (из Firebase)`);
 
   const jobId = `sub_${userId}_${subscriptionId}`;
   
@@ -198,11 +222,9 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
         return;
       }
 
-      // ВАЖНО: Используем фиксированную сумму из данных подписки, а не получаем текущую цену
-      // Это гарантирует консистентность цены для всей подписки
-      const paymentAmount = subscriptionData.amount || fixedAmount;
-      
-      console.log(`💰 Используется фиксированная сумма списания: ${paymentAmount} (из данных подписки)`);
+      // Получаем актуальную цену на момент списания
+      const currentRecurringPrice = await getRecurringPaymentPrice();
+      const paymentAmount = currentRecurringPrice;
       
       // Выполняем платеж
       await executeRecurrentPayment({
@@ -218,22 +240,22 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
       const nextDate = new Date(paymentDate);
       nextDate.setMonth(nextDate.getMonth() + 1);
       
-      // Обновляем подписку (цена остается той же)
+      // Обновляем подписку с актуальной ценой
       await subscriptionRef.update({
         nextPaymentDate: nextDate.toISOString(),
         lastScheduledPayment: new Date().toISOString(),
-        amount: paymentAmount, // Сохраняем ту же фиксированную сумму
+        amount: paymentAmount, // Обновляем сумму следующего платежа
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
-      // Планируем следующий платеж с той же фиксированной суммой
+      // Планируем следующий платеж
       await scheduleSubscriptionPayment(userId, {
         ...subscriptionData,
         nextPaymentDate: nextDate.toISOString(),
-        amount: paymentAmount // Передаем ту же фиксированную сумму
+        amount: paymentAmount
       });
       
-      console.log(`✅ Следующий платеж запланирован на ${nextDate.toISOString()} с фиксированной суммой ${paymentAmount}`);
+      console.log(`✅ Следующий платеж запланирован на ${nextDate.toISOString()} с суммой ${paymentAmount}`);
     } catch (error) {
       console.error(`❌ Ошибка автоматического списания для ${userId}:`, error);
       
@@ -254,7 +276,7 @@ async function scheduleSubscriptionPayment(userId, subscriptionData) {
   });
 
   scheduledJobs.set(jobId, job);
-  console.log(`✅ Платеж запланирован для ${userId} на ${paymentDate.toISOString()} с фиксированной суммой ${fixedAmount}`);
+  console.log(`✅ Платеж запланирован для ${userId} на ${paymentDate.toISOString()} с суммой ${amount}`);
   
   return jobId;
 }
@@ -459,6 +481,7 @@ async function restoreScheduledJobs() {
     }
     
     console.log(`✅ Восстановлено ${restoredCount} запланированных платежей из ${subscriptionsSnapshot.size} найденных подписок`);
+    console.log(`📅 Активных запланированных платежей: ${scheduledJobs.size}`);
     
   } catch (error) {
     console.error('❌ Ошибка при восстановлении расписания:', error.message);
@@ -470,6 +493,7 @@ module.exports = {
   scheduleSubscriptionPayment,
   executeRecurrentPayment,
   restoreScheduledJobs,
+  getFirstPaymentPrice,
   getRecurringPaymentPrice,
   checkOtherActiveSubscriptions,
   cancelOtherActiveSubscriptions
