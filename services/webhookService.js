@@ -72,29 +72,25 @@ async function handleWebhook(req, res, services) {
         console.log('🔄 ВЕБХУК: Асинхронная обработка началась...');
 
         // === Защита от дублей ===
-        const webhookKey = `wh_${PaymentId}_${Status}_${RebillId || 'norebill'}`;
+        const webhookKey = `wh_${PaymentId}_${Status}`;
         const webhookLogRef = db.collection('webhookLogs').doc(webhookKey);
-        if ((await webhookLogRef.get()).exists) {
+        const webhookLogDoc = await webhookLogRef.get();
+        
+        if (webhookLogDoc.exists) {
           console.log(`⚠️ Дубликат вебхука: ${webhookKey}`);
           return;
         }
 
-        // Подготавливаем данные для лога без undefined значений
-        const webhookLogData = {
+        // Логируем вебхук
+        await webhookLogRef.set({
           processedAt: admin.firestore.FieldValue.serverTimestamp(),
           status: Status,
           orderId: OrderId,
           paymentId: PaymentId,
           success: Success === 'true' || Success === true,
+          rebillId: RebillId,
           data: webhookData
-        };
-
-        // Добавляем rebillId только если он существует
-        if (RebillId) {
-          webhookLogData.rebillId = RebillId;
-        }
-
-        await webhookLogRef.set(webhookLogData, { ignoreUndefinedProperties: true });
+        }, { ignoreUndefinedProperties: true });
 
         let orderInfo = null;
         let rebillIdToProcess = RebillId;
@@ -304,19 +300,83 @@ async function handleWebhook(req, res, services) {
           else if (orderInfo.collection === 'orders') {
             console.log(`🔁 Обработка подписки: ${orderInfo.orderId}`);
             
-            if (typeof updatePaymentFromWebhook === 'function') {
-              const updatedRebillId = await updatePaymentFromWebhook(
-                orderInfo.userId,
-                orderInfo.orderId,
-                webhookData
-              );
+            // Проверяем, создана ли уже подписка для этого платежа
+            const subscriptionCheckRef = db.collection('subscriptionCreations').doc(PaymentId);
+            const subscriptionCheckDoc = await subscriptionCheckRef.get();
+            
+            if (Status === 'AUTHORIZED') {
+              // При AUTHORIZED только обновляем платеж, но не создаем подписку
+              console.log(`🔄 Получен статус AUTHORIZED, обновляю платеж но откладываю создание подписки`);
+              
+              if (typeof updatePaymentFromWebhook === 'function') {
+                const updatedRebillId = await updatePaymentFromWebhook(
+                  orderInfo.userId,
+                  orderInfo.orderId,
+                  webhookData
+                );
 
-              rebillIdToProcess = rebillIdToProcess || updatedRebillId;
+                rebillIdToProcess = rebillIdToProcess || updatedRebillId;
+                
+                // Сохраняем информацию о том, что платеж авторизован
+                await subscriptionCheckRef.set({
+                  paymentId: PaymentId,
+                  orderId: OrderId,
+                  userId: orderInfo.userId,
+                  status: 'AUTHORIZED',
+                  rebillId: rebillIdToProcess,
+                  authorizedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  amount: Amount,
+                  webhookData: webhookData
+                }, { ignoreUndefinedProperties: true });
+              }
             }
+            else if (Status === 'CONFIRMED') {
+              console.log(`🔄 Получен статус CONFIRMED, создаю подписку`);
+              
+              if (typeof updatePaymentFromWebhook === 'function') {
+                const updatedRebillId = await updatePaymentFromWebhook(
+                  orderInfo.userId,
+                  orderInfo.orderId,
+                  webhookData
+                );
 
-            if (rebillIdToProcess) {
-              await saveUserSubscription(orderInfo.userId, webhookData, rebillIdToProcess);
-              console.log('🔁 Подписка обновлена!');
+                rebillIdToProcess = rebillIdToProcess || updatedRebillId;
+                
+                // Проверяем, не создана ли уже подписка для этого платежа
+                if (!subscriptionCheckDoc.exists || 
+                    subscriptionCheckDoc.data().status !== 'CONFIRMED') {
+                  
+                  // Создаем/обновляем подписку
+                  if (typeof saveUserSubscription === 'function' && rebillIdToProcess) {
+                    await saveUserSubscription(orderInfo.userId, webhookData, rebillIdToProcess);
+                    console.log('🔁 Подписка создана!');
+                  }
+                  
+                  // Отмечаем, что подписка создана
+                  await subscriptionCheckRef.set({
+                    paymentId: PaymentId,
+                    orderId: OrderId,
+                    userId: orderInfo.userId,
+                    status: 'CONFIRMED',
+                    rebillId: rebillIdToProcess,
+                    confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    subscriptionCreated: true,
+                    amount: Amount,
+                    webhookData: webhookData
+                  }, { ignoreUndefinedProperties: true });
+                } else {
+                  console.log('⚠️ Подписка уже была создана ранее для этого платежа');
+                }
+              }
+            } else {
+              // Для других статусов просто обновляем платеж
+              if (typeof updatePaymentFromWebhook === 'function') {
+                await updatePaymentFromWebhook(
+                  orderInfo.userId,
+                  orderInfo.orderId,
+                  webhookData
+                );
+              }
             }
           }
 
