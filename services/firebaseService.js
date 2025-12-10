@@ -138,155 +138,272 @@ async function updatePaymentFromWebhook(userId, orderId, webhookData) {
   }
 }
 
-/**
- * Сохраняет подписку пользователя и планирует автоматические списания
- */
-/**
- * Сохраняет подписку пользователя и планирует автоматические списания
- */
-/**
- * Сохраняет подписку пользователя и планирует автоматические списания
- */
 async function saveUserSubscription(userId, webhookData, rebillId) {
   try {
-    const { CardId, Pan, Amount, OrderId } = webhookData;
+    const { CardId, Pan, Amount, OrderId, PaymentId } = webhookData;
     
-    // Используем реальную сумму из вебхука (Amount в копейках)
-    const actualAmount = Amount / 100; // Конвертируем из копеек в рубли
+    // === 1. ПРОВЕРКА НА ДУБЛИРОВАНИЕ ===
+    const paymentKey = `payment_${PaymentId}`;
+    const paymentCheckRef = db.collection('processedPayments').doc(paymentKey);
+    const paymentCheckDoc = await paymentCheckRef.get();
     
-    // Получаем цену повторного списания из Firebase
-    let recurringPaymentPrice = actualAmount; // Используем фактическую сумму по умолчанию
-    
-    try {
-      const subscriptionProductRef = db.collection('subscriptionProducts')
-        .doc('subscription_1765286344111');
-      const subscriptionProductDoc = await subscriptionProductRef.get();
+    if (paymentCheckDoc.exists) {
+      const existingData = paymentCheckDoc.data();
+      console.log(`⚠️ Платеж ${PaymentId} уже обработан ранее. Подписка: ${existingData.subscriptionId || 'нет ID'}`);
       
-      if (subscriptionProductDoc.exists) {
-        const productData = subscriptionProductDoc.data();
-        if (productData.recurringPaymentPrice) {
-          recurringPaymentPrice = productData.recurringPaymentPrice;
-          console.log(`✅ Получена цена повторного списания: ${recurringPaymentPrice}`);
-        }
+      // Если подписка уже существует, возвращаем ее ID
+      if (existingData.subscriptionId) {
+        return { 
+          alreadyProcessed: true, 
+          subscriptionId: existingData.subscriptionId,
+          userId: existingData.userId
+        };
       }
-    } catch (priceError) {
-      console.error('❌ Ошибка получения цены повторного списания:', priceError.message);
-      console.log(`⚠️ Используется фактическая сумма: ${actualAmount}`);
     }
     
-    // ПРОВЕРКА: Есть ли уже активная подписка у пользователя
+    // === 2. ПОЛУЧЕНИЕ ЦЕН ИЗ БАЗЫ ДАННЫХ ===
+    // Получаем цену первого платежа
+    const firstPaymentPrice = await getFirstPaymentPrice();
+    console.log(`💰 Цена первого платежа из БД: ${firstPaymentPrice} руб.`);
+    
+    // Получаем цену повторного списания
+    const recurringPaymentPrice = await getRecurringPaymentPrice();
+    console.log(`💰 Цена повторного списания из БД: ${recurringPaymentPrice} руб.`);
+    
+    // === 3. ПРОВЕРКА АКТИВНЫХ ПОДПИСОК ===
     const subscriptionsRef = db.collection('telegramUsers')
       .doc(userId.toString())
       .collection('subscriptions');
     
-    // Ищем активные подписки с таким же rebillId или статусом active
+    // Ищем активные подписки
     const existingSubscriptions = await subscriptionsRef
       .where('status', '==', 'active')
       .limit(1)
       .get();
     
+    let subscriptionId;
+    let isExistingSubscription = false;
+    
     if (!existingSubscriptions.empty) {
       const existingDoc = existingSubscriptions.docs[0];
       const existingData = existingDoc.data();
+      subscriptionId = existingDoc.id;
       
       // Если уже есть активная подписка с таким же rebillId
       if (existingData.rebillId === rebillId) {
         console.log(`⚠️ У пользователя ${userId} уже есть активная подписка с rebillId ${rebillId}`);
-        console.log(`📝 Обновляю существующую подписку ${existingDoc.id}`);
+        console.log(`📝 Обновляю существующую подписку ${subscriptionId}`);
         
-        // Обновляем существующую подписку с ценой повторного списания
+        // Проверяем, не был ли этот платеж уже добавлен
+        const existingPayment = existingData.paymentHistory?.find(
+          payment => payment.paymentId === PaymentId
+        );
+        
+        if (existingPayment) {
+          console.log(`⚠️ Платеж ${PaymentId} уже есть в истории подписки ${subscriptionId}`);
+          
+          // Помечаем платеж как обработанный
+          await paymentCheckRef.set({
+            paymentId: PaymentId,
+            userId: userId,
+            subscriptionId: subscriptionId,
+            processedAt: new Date().toISOString(),
+            amount: firstPaymentPrice,
+            status: 'already_in_history'
+          }, { ignoreUndefinedProperties: true });
+          
+          return { 
+            alreadyProcessed: true, 
+            subscriptionId: subscriptionId,
+            updated: false 
+          };
+        }
+        
+        // Обновляем существующую подписку
         const updateData = {
           lastSuccessfulPayment: new Date().toISOString(),
-          totalPaid: adminInstance.firestore.FieldValue.increment(actualAmount),
+          totalPaid: adminInstance.firestore.FieldValue.increment(firstPaymentPrice),
           paymentHistory: adminInstance.firestore.FieldValue.arrayUnion({
             date: new Date().toISOString(),
-            amount: actualAmount,
-            paymentId: webhookData.PaymentId,
+            amount: firstPaymentPrice,
+            paymentId: PaymentId,
             orderId: OrderId,
-            status: 'success'
+            status: 'success',
+            type: 'recurring_payment'
           }),
           updatedAt: adminInstance.firestore.FieldValue.serverTimestamp(),
-          // Обновляем nextPaymentDate на месяц вперед
           nextPaymentDate: new Date(new Date().setMonth(new Date().getMonth() + 1)).toISOString(),
           webhookData: webhookData,
-          // Обновляем сумму следующего платежа
           amount: recurringPaymentPrice
         };
         
         await existingDoc.ref.update(updateData);
         
-        // Обновляем планирование с новой ценой
-        const subscriptionId = existingDoc.id;
-        schedulerService.scheduleSubscriptionPayment(userId, {
+        // Обновляем планирование
+        await schedulerService.scheduleSubscriptionPayment(userId, {
           ...existingData,
           ...updateData,
           subscriptionId,
           email: webhookData.Email || existingData.email || 'user@example.com',
-          amount: recurringPaymentPrice // Используем цену повторного списания
+          amount: recurringPaymentPrice
         });
         
-        return { subscriptionId: existingDoc.id, updated: true };
+        // Помечаем платеж как обработанный
+        await paymentCheckRef.set({
+          paymentId: PaymentId,
+          userId: userId,
+          subscriptionId: subscriptionId,
+          processedAt: new Date().toISOString(),
+          amount: firstPaymentPrice,
+          status: 'updated_existing_subscription'
+        }, { ignoreUndefinedProperties: true });
+        
+        return { subscriptionId: subscriptionId, updated: true };
       }
       
       // Если есть активная подписка, но с другим rebillId
       console.log(`⚠️ У пользователя ${userId} уже есть активная подписка. Отменяю старую и создаю новую.`);
-      
-      // Отменяем старую подписку
-      await cancelUserSubscription(userId, existingDoc.id);
+      await cancelUserSubscription(userId, subscriptionId);
     }
     
-    // Создаем новую подписку (если не было активной или была отменена)
+    // === 4. СОЗДАНИЕ НОВОЙ ПОДПИСКИ ===
     const now = new Date();
     const nextPaymentDate = new Date(now);
     nextPaymentDate.setMonth(nextPaymentDate.getMonth() + 1);
+    
+    subscriptionId = `sub_${Date.now()}`;
     
     const subscriptionData = {
       rebillId: rebillId,
       cardLastDigits: Pan ? Pan.slice(-4) : null,
       cardId: CardId,
       status: 'active',
-      amount: recurringPaymentPrice, // Используем цену повторного списания
+      amount: recurringPaymentPrice,
       initialPaymentDate: now.toISOString(),
       nextPaymentDate: nextPaymentDate.toISOString(),
       lastSuccessfulPayment: now.toISOString(),
-      totalPaid: actualAmount, // Используем фактическую сумму первого платежа
+      totalPaid: firstPaymentPrice,
       paymentHistory: [{
         date: now.toISOString(),
-        amount: actualAmount,
-        paymentId: webhookData.PaymentId,
+        amount: firstPaymentPrice,
+        paymentId: PaymentId,
         orderId: OrderId,
-        status: 'success'
+        status: 'success',
+        type: 'initial_payment'
       }],
+      priceSettings: {
+        firstPaymentPrice: firstPaymentPrice,
+        recurringPaymentPrice: recurringPaymentPrice,
+        savedAt: now.toISOString()
+      },
       createdAt: adminInstance.firestore.FieldValue.serverTimestamp(),
       updatedAt: adminInstance.firestore.FieldValue.serverTimestamp(),
       webhookData: webhookData
     };
     
-    const subscriptionId = `sub_${Date.now()}`;
-    
     await subscriptionsRef.doc(subscriptionId).set(subscriptionData);
     
     console.log(`✅ Подписка сохранена для userId=${userId}, subscriptionId=${subscriptionId}`);
-    console.log(`💰 Первый платеж: ${actualAmount} руб.`);
-    console.log(`💰 Цена повторного списания: ${recurringPaymentPrice} руб.`);
+    console.log(`💰 Первый платеж (из БД): ${firstPaymentPrice} руб.`);
+    console.log(`💰 Цена повторного списания (из БД): ${recurringPaymentPrice} руб.`);
     
-    // Планируем автоматическое списание с ценой повторного списания
-    schedulerService.scheduleSubscriptionPayment(userId, {
+    // Планируем автоматическое списание
+    await schedulerService.scheduleSubscriptionPayment(userId, {
       ...subscriptionData,
       subscriptionId,
       email: webhookData.Email || 'user@example.com',
       amount: recurringPaymentPrice
     });
     
+    // Помечаем платеж как обработанный
+    await paymentCheckRef.set({
+      paymentId: PaymentId,
+      userId: userId,
+      subscriptionId: subscriptionId,
+      processedAt: new Date().toISOString(),
+      amount: firstPaymentPrice,
+      status: 'new_subscription_created'
+    }, { ignoreUndefinedProperties: true });
+    
     return { 
       subscriptionId, 
       nextPaymentDate: nextPaymentDate.toISOString(),
-      initialAmount: actualAmount,
+      firstPaymentPrice: firstPaymentPrice,
       recurringPaymentPrice: recurringPaymentPrice 
     };
+    
   } catch (error) {
     console.error('❌ Ошибка сохранения подписки:', error);
+    
+    // Логируем ошибку
+    try {
+      await db.collection('subscriptionErrors').doc(`${Date.now()}_${userId}`).set({
+        userId: userId,
+        paymentId: webhookData?.PaymentId,
+        error: error.message,
+        stack: error.stack,
+        timestamp: new Date().toISOString(),
+        webhookData: webhookData
+      }, { ignoreUndefinedProperties: true });
+    } catch (logError) {
+      console.error('❌ Не удалось сохранить ошибку:', logError);
+    }
+    
     return false;
+  }
+}
+
+// Вспомогательные функции (добавьте в этот же файл):
+
+/**
+ * Получает цену первого платежа из базы данных
+ */
+async function getFirstPaymentPrice() {
+  try {
+    const subscriptionProductRef = db.collection('subscriptionProducts')
+      .doc('subscription_1765286344111');
+    const subscriptionProductDoc = await subscriptionProductRef.get();
+    
+    if (subscriptionProductDoc.exists) {
+      const productData = subscriptionProductDoc.data();
+      if (productData.firstPaymentPrice !== undefined) {
+        const price = productData.firstPaymentPrice;
+        console.log(`✅ Получена цена первого платежа из Firebase: ${price}`);
+        return price;
+      }
+    }
+    
+    console.log('⚠️ Цена первого платежа не найдена, используется значение по умолчанию: 390');
+    return 390;
+  } catch (error) {
+    console.error('❌ Ошибка получения цены первого платежа:', error.message);
+    return 390;
+  }
+}
+
+/**
+ * Получает цену повторного списания из базы данных
+ */
+async function getRecurringPaymentPrice() {
+  try {
+    const subscriptionProductRef = db.collection('subscriptionProducts')
+      .doc('subscription_1765286344111');
+    const subscriptionProductDoc = await subscriptionProductRef.get();
+    
+    if (subscriptionProductDoc.exists) {
+      const productData = subscriptionProductDoc.data();
+      if (productData.recurringPaymentPrice !== undefined) {
+        const price = productData.recurringPaymentPrice;
+        console.log(`✅ Получена цена повторного списания из Firebase: ${price}`);
+        return price;
+      }
+    }
+    
+    console.log('⚠️ Цена повторного списания не найдена, используется значение по умолчанию: 390');
+    return 390;
+  } catch (error) {
+    console.error('❌ Ошибка получения цены повторного списания:', error.message);
+    return 390;
   }
 }
 
